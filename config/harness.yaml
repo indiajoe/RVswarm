@@ -1,0 +1,84 @@
+# =============================================================================
+# HARNESS CONFIGURATION  --  owned by humans. Agents can neither read nor edit
+# this file (it is outside the agent file sandbox `workspace/`).
+# Paths may be overridden with environment variables (see config/cluster.env),
+# because the data lives at a different path inside SLURM jobs.
+# =============================================================================
+data:
+  # Directory holding the vetted NEID L2 solar FITS files (searched recursively
+  # for neidL2_*.fits).  Override with $NEID_DATA_DIR.
+  l2_dir: /workspace/NEIDData
+  # Compact per-day store written by `harness.ingest`.  Override: $RVSWARM_STORE
+  store_dir: data_store/main
+  # Small store built from the few sample files, used only for local smoke tests
+  sample_store_dir: data_store/sample
+  # Which raw files go into the store. The draw is made by `harness.ingest plan` with a seed
+  # derived from the harness secret and `label`; change `label` (and store_dir) for an
+  # independent draw.
+  #   mode: none     every file
+  #   mode: spectra  n_spectra files drawn uniformly from all files
+  #   mode: days     n_days random days, per_day files on each, spread through the day
+  # The curated data set is staged by the humans, so the harness draws nothing itself.
+  draw: {mode: none, label: 1, n_spectra: 500, n_days: 100, per_day: 30}
+  min_obs_per_day: 1         # curated set: about one 5-min p-mode-averaged spectrum per epoch
+  # Observations are dropped at ingest if any of these fail
+  quality:
+    require_dqlevel2_zero: true
+    min_extsnr: 100
+    max_airmass: 2.25
+
+partitions:
+  # The last `sealed_fraction` of observing days (in time) is SEALED: it is only
+  # scored in `sealed` stage runs, which are rationed (see promotion).
+  sealed_fraction: 0.30
+  screen_days: 100000        # screen stage uses the first N calendar days of DEV. With a few hundred
+                             # spectra the whole DEV set is cheap, so screen = all of DEV (1 injection)
+
+injection:
+  # Blind planets are injected by Doppler-shifting the wavelength solution, the
+  # CCF velocity grid and every pipeline RV *before* an algorithm sees the data.
+  epoch: 1                   # bump to re-draw all hidden signals (then re-run baselines)
+  bands_days: [[2, 6], [6, 15], [15, 40], [40, 120], [120, 400]]   # one planet per band
+  k_range_ms: [0.08, 0.25]   # semi-amplitude, log-uniform, m/s
+  max_period_fraction_of_baseline: 0.5
+
+stages:
+  screen: {n_injections: 1, partition: screen}
+  full:   {n_injections: 2, partition: dev}
+  sealed: {n_injections: 2, partition: all, score_on: sealed}
+
+gates:
+  transfer_range: [0.80, 1.20]   # recovered/injected amplitude, every band
+  max_quadrature: 0.20           # out-of-phase leakage, every band
+  min_valid_fraction: 0.95       # finite outputs required
+  target_rms_ms: 0.20            # the goal: effective RMS per epoch below this (m/s)
+
+promotion:                       # applied by harness/promote.py -- no agent input
+  screen_to_full_max_ratio: 0.95       # effective_rms / raw_rms must be below this
+  full_to_sealed_max_ratio: 0.60
+  sealed_runs_per_month: 12
+  sealed_max_per_family_per_month: 4
+  success_needed: 3                    # algorithms passing on SEALED ...
+  success_min_families: 2              # ... from at least this many families
+
+resources:                       # hard caps on what an algorithm may request
+  max_cpus: 32
+  max_mem_gb: 256
+  max_hours: {screen: 8, full: 16, sealed: 24}
+  max_gpus: 1
+  # an algorithm requests hours for the SCREEN stage; larger stages get this multiple
+  # (screen and full now use the same data; full has one more run, sealed uses all data)
+  time_factor: {screen: 1, full: 2, sealed: 3}
+  default: {cpus: 8, mem_gb: 64, hours: 4, gpus: 0}
+
+audit:
+  allowed_imports: [numpy, scipy, sklearn, torch, jax, jaxopt, optax, numba, pandas,
+                    statsmodels, astropy, celerite2, george, tinygp, emcee, pywt,
+                    xgboost, lightgbm, einops, math, cmath, dataclasses, typing,
+                    functools, itertools, collections, time, warnings, json, logging,
+                    random, statistics, heapq, bisect, copy, enum, abc, re, string,
+                    datetime, concurrent, multiprocessing, threading, queue, joblib,
+                    numbers, contextlib, textwrap, hashlib, fractions, decimal]
+  forbidden_submodules: [astropy.io, numpy.ctypeslib, torch.hub, torch.utils.cpp_extension,
+                         scipy.io, pandas.io, joblib.externals, multiprocessing.shared_memory]
+  max_diagnostic_bytes: 20000000
