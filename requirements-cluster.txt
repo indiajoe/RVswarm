@@ -1,0 +1,23 @@
+# Environment used by SLURM evaluation jobs: the harness plus every package
+# algorithms are allowed to import (config/harness.yaml -> audit.allowed_imports).
+numpy
+scipy
+astropy
+pyyaml
+scikit-learn
+pandas
+statsmodels
+numba
+joblib
+PyWavelets
+celerite2
+george
+tinygp
+emcee
+xgboost
+lightgbm
+einops
+jax
+jaxopt
+optax
+torch          # install the build matching your cluster's CUDA

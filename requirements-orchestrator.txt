@@ -1,0 +1,6 @@
+# Host that runs the swarm (API calls + implementers' toy self-tests)
+anthropic>=2.8
+pyyaml
+numpy
+scipy
+astropy
