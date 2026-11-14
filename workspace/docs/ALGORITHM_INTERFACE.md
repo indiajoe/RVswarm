@@ -1,0 +1,156 @@
+# Algorithm interface
+
+This is the complete contract between an algorithm and the evaluation harness.
+Nothing outside this document is available to algorithm code.
+
+## 1. Files
+
+An algorithm lives in `workspace/algorithms/<alg_id>/`:
+
+| file | purpose |
+|---|---|
+| `SPEC.md` | the approved proposal the code implements (written by the proposer) |
+| `algorithm.py` | must define `run(ctx)`; may import sibling `.py` files in the same directory |
+| `algorithm.yaml` | name, family, resource request (below) |
+| `IMPLEMENTATION_NOTES.md` | what was built, every deviation from the spec and why |
+
+```yaml
+# algorithm.yaml
+name: short human-readable name
+family: F03                 # registry family id
+resources:
+  cpus: 8                   # <= 32
+  mem_gb: 64                # <= 256
+  gpus: 0                   # 0 or 1
+  hours: 4                  # wall time for all runs of a SCREEN evaluation (development data,
+                            # 2 runs). Later stages automatically get 2x (full) and 3x (sealed),
+                            # capped at 8 / 16 / 24 h. Request memory for the complete data set.
+  parallel_runs: false      # true: the 2-3 runs of an evaluation share the CPUs concurrently (CPU only)
+```
+
+## 2. Entry point
+
+```python
+def run(ctx):
+    ds = ctx.target                      # SolarDataset: the observations to correct
+    ...
+    return {"rv_clean": rv,              # REQUIRED float array [ds.n_obs], m/s, one per observation,
+                                         # same order as ds.obs_id. Arbitrary zero point.
+            "rv_err": err}               # optional, same shape
+```
+
+`rv_clean` is your best estimate of the Sun's centre-of-mass radial velocity at each
+observation with stellar-activity, granulation and instrumental signals removed.
+A real planet's Doppler signal must survive in it.
+
+* NaN marks an observation you could not correct. More than 5 % NaN (per observation
+  or per day) fails the run.
+* The function is called in a fresh process for each run of an evaluation. The same
+  code is run two or three times on data that differ only by hidden injected planets;
+  there is no way to tell the runs apart, and nothing persists between them.
+* Do not print or return anything that depends on knowing the hidden planets; you
+  cannot know them.
+
+## 3. `ctx`
+
+| member | meaning |
+|---|---|
+| `ctx.target` | `SolarDataset` (section 4) |
+| `ctx.n_cpus`, `ctx.gpu` | granted CPU cores; whether a CUDA GPU is available |
+| `ctx.time_budget_s`, `ctx.elapsed()` | wall-time budget for this run and seconds used so far. Exceeding it kills the run. |
+| `ctx.seed` | integer; use it for all random number generators (identical across runs) |
+| `ctx.scratch_file(name)` | path string of a private scratch file (flat names like `"feat.npy"`); use with `np.save`, `np.load`, `np.memmap`, `torch.save`. Wiped after the run. |
+| `ctx.log(*parts)` | progress message (the log tail of the un-injected dev run is shown in the result report) |
+| `ctx.metric(name, value)` | record a scalar intermediate check; printed in the result report |
+| `ctx.diagnostic(name, array)` | record a small array (periodogram, eigen-spectrum, coefficients...); summarised in the report. 20 MB total. |
+
+`ctx.metric` / `ctx.diagnostic` are how proposers get the intermediate checks they
+asked for. They are published for development-data runs only, never for sealed runs.
+
+## 4. `SolarDataset`
+
+All RV-bearing quantities already contain any hidden planet, consistently.
+
+Attributes (read-only NumPy arrays, length `n_obs`, sorted by time):
+
+| attribute | meaning |
+|---|---|
+| `n_obs`, `n_orders` (122), `n_pix` (9216), `n_vel` (804) | sizes |
+| `obs_id` | observation identifiers |
+| `time` | BJD_TDB of flux-weighted mid-exposure, days |
+| `day` | integer observing-day label (one value per calendar day of observing) |
+| `rv_pipeline`, `rv_pipeline_err` | NEID DRP order-weighted CCF RV and its photon-noise estimate, m/s |
+| `rv_pipeline_sum` | DRP RV from the summed CCF, m/s |
+| `order_rv`, `order_weight` | `[n_obs, 122]` per-order DRP CCF RVs (m/s; NaN where the DRP has none) and DRP order weights |
+| `physical_order` | `[122]` echelle order number of each order index (173 ... 52) |
+| `scalar_names`, `activity_names` | available names for the two accessors below |
+| `has_spectra` | True when `spectrum()` is available |
+
+Methods:
+
+| call | returns |
+|---|---|
+| `ds.scalar(name)` | `[n_obs]` header scalar. Includes CCF shape (`FWHMMOD`, `BISMOD`, `FITMODV0/2/3`, ...), observing geometry (`AIRMASS`, `SUNAGL`, `TCSZA`, ...), `EXPTIME`, `EXTSNR`, drift (`DRIFTRV0`), telluric model (`WVAPOR`, `ZENITH`), environment and thermal telemetry (`ENV*`, `LS218_*`, `CCDTEMP`, `TMC*`). |
+| `ds.activity(name)` | `(value, uncertainty)`, each `[n_obs]`: DRP activity indices (`CaIIHK`, `Ha06_1`, `NaI`, `CaIRT1..3`, `HeI_1`, `Mn539`, `PaDelta`, ... and `_tellcorr` variants) |
+| `ds.ccf(sel=None)` | `(velocity, ccf)`: `velocity [k, 804]` km/s and `ccf [k, 122, 804]` float32 per-order CCFs (G2 ESPRESSO mask, 0.25 km/s steps, about -100 ... +100 km/s). Orders without mask lines are all zeros. `sel` = index array / boolean mask / None (all; can be very large -- prefer batches). |
+| `ds.ccf_batches(batch_size=256)` | iterator of `(obs_indices, velocity, ccf)` over the whole set |
+| `ds.spectrum(i, orders=None)` | dict for observation `i` and the selected order indices (default all): `wave` (float64, vacuum Angstrom, **observatory frame**), `flux`, `var` (electrons; not blaze corrected; already telluric-corrected), `blaze`, each `[n_sel, 9216]` (no telluric model arrays are provided); `ssb_z` `[n_sel]` (DRP barycentric redshift; `wave * (1 + ssb_z)` is the barycentric wavelength); `order_index`. Pixels may be NaN. |
+| `ds.spectra(indices=None, orders=None, workers=4)` | iterator of `(i, spectrum_dict)` with threaded read-ahead |
+| `ds.subset(sel)` | new `SolarDataset` restricted to a mask / index array |
+
+A `SolarDataset` cannot be pickled. For parallel work use threads, `ds.spectra(workers=...)`,
+or process pools that receive plain NumPy arrays.
+
+Cost guide: scalars, RVs and indices are in memory. CCFs cost about 0.4 MB per
+observation to load. A full spectrum is about 30 MB and roughly 0.1-0.3 s to read. The
+data set is a few hundred to a couple of thousand observations (5-minute averages,
+usually one per observing day), so a pass over every spectrum is affordable; still read
+only the orders you need and cache derived features with `ctx.scratch_file`.
+
+## 5. Rules for code (enforced by an automatic audit before every run)
+
+* Imports are limited to: numpy, scipy, sklearn, torch, jax, optax, numba, pandas,
+  statsmodels, astropy (not `astropy.io`), celerite2, george, tinygp, emcee, pywt,
+  xgboost, lightgbm, einops, joblib, and the standard-library modules math, cmath,
+  dataclasses, typing, functools, itertools, collections, time, warnings, json,
+  logging, random, statistics, heapq, bisect, copy, enum, abc, re, string, datetime,
+  concurrent, multiprocessing, threading, queue, numbers, contextlib,
+  hashlib. Ask for additions through `workspace/diagnostic_requests/`.
+* Not allowed: `os`, `sys`, `subprocess`, `pathlib`, `open`, `eval`, `exec`,
+  `getattr`/`setattr`, `vars`, `globals`, dunder attributes other than `__init__`-style
+  methods, private attributes (`._x`) of objects other than `self`, path-like string
+  literals, network access, reading any file other than your own scratch files.
+* **Only information contained in the NEID L2 solar spectra files may be used.** No
+  external solar data (SDO, sunspot numbers, F10.7, magnetograms, other
+  spectrographs), no hard-coded tables derived from such data, no pre-trained
+  weights. General physical constants, atomic line lists typed into the code with a
+  citation, and textbook ephemeris formulae are fine.
+* No hard-coded dates, observation ids or per-epoch corrections. The same code
+  must work on any time span of this instrument.
+
+## 6. How an evaluation is scored (fixed; proposers and implementers have no say)
+
+1. Your code runs on the data as it is, and again on copies with hidden circular-orbit
+   planets (one per period band between 2 and 400 days, semi-amplitudes of order
+   10-25 cm/s) Doppler-injected at the spectrum level.
+2. Outputs are combined per epoch (observing day) with fixed pipeline weights; with one
+   spectrum per day an epoch is a single observation.
+3. **RMS** = standard deviation over epochs of `rv_clean` of the un-injected run.
+4. **Transfer** per planet = recovered / injected amplitude, from the difference
+   between injected and un-injected outputs. It must lie in [0.8, 1.2] for every
+   planet, with little phase distortion (the *gate*).
+5. **Effective RMS** = RMS / min(1, smallest transfer). This is the ranking metric.
+6. Goal: gate passed and effective RMS below 0.20 m/s, confirmed on sealed data that no
+   one has developed against.
+
+Stages: `screen` (development data, 1 injection) -> `full` (development
+data, 2 injections) -> `sealed` (rationed). Promotion between stages follows fixed
+numerical rules.
+
+## 7. Local self-test available to implementers
+
+The `run_tests` tool runs the audit and then the algorithm on a **toy synthetic Sun**
+with the same array shapes as the real data (about 300 observations, one per day, over
+about 900 days).
+The toy is not physically faithful: use it to prove the code runs, returns the right
+shapes, is deterministic and preserves injected planets -- never to tune physics.
