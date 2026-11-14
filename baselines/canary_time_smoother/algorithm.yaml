@@ -1,0 +1,3 @@
+name: canary_time_smoother
+family: canary
+resources: {cpus: 4, mem_gb: 32, hours: 3, gpus: 0}
