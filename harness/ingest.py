@@ -98,7 +98,10 @@ def _passes(rec: dict, q: dict) -> bool:
         return False
     if s.get("EXTSNR", 0) < q.get("min_extsnr", 0):
         return False
-    if s.get("AIRMASS", 0) > q.get("max_airmass", 99):
+    # The AIRMASS keyword is the pointing of the idle night-time telescope, not of the
+    # solar feed, so the cut uses the Sun's zenith angle (TELLURIC header).
+    z = s.get("ZENITH", np.nan)
+    if np.isfinite(z) and z < 89 and 1.0 / np.cos(np.radians(z)) > q.get("max_airmass", 99):
         return False
     return True
 

@@ -25,7 +25,7 @@ data:
   quality:
     require_dqlevel2_zero: true
     min_extsnr: 100
-    max_airmass: 2.25
+    max_airmass: 3.0         # of the Sun, from its zenith angle (not the telescope AIRMASS keyword)
 
 partitions:
   # The last `sealed_fraction` of observing days (in time) is SEALED: it is only

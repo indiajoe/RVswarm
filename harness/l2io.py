@@ -24,7 +24,7 @@ PRIMARY_SCALARS = [
     "LS218_1", "LS218_2", "LS218_3", "LS218_4", "LS218_5", "LS218_6", "LS218_7",
     "LS218_8", "PMKSTOP", "PMKSBOT", "PNEXTORR", "CCDTEMP", "MOLYTEMP", "SLUGTEMP",
     "CCDHEAT", "SLUGHEAT", "EXTSNR", "DRIFTRV0", "DRIFTRV1", "DRIFTRV2",
-    "DQLEVEL1", "DQLEVEL2",
+    "DQLEVEL1", "DQLEVEL2", "NCOMBINE",
 ]
 PRIMARY_PREFIXES = ("TMCV", "TMCT")       # thermal-control telemetry
 # CCFS-header scalars with no RV content (RV-bearing ones are handled explicitly).
@@ -84,7 +84,11 @@ def read_lite(path) -> dict:
         out["jd"] = _num(hc.get("CCFJDMOD"))                     # BJD_TDB, flux-weighted
         out["rv"] = _num(hc.get("CCFRVMOD")) * 1e3               # m/s
         out["rv_sum"] = _num(hc.get("CCFRVSUM")) * 1e3
-        out["rv_err"] = _num(hc.get("DVRMSMOD")) * 1e3
+        # In combined files DVRMSMOD is the mean of the single-frame values, so the
+        # uncertainty of the mean RV is smaller by sqrt(NCOMBINE).
+        ncomb = _num(h0.get("NCOMBINE"))
+        ncomb = ncomb if np.isfinite(ncomb) and ncomb >= 1 else 1.0
+        out["rv_err"] = _num(hc.get("DVRMSMOD")) * 1e3 / np.sqrt(ncomb)
         out["order_rv"] = np.array([_num(hc.get("CCFRV" + k)) for k in ORDER_KEYS]) * 1e3
         out["order_wt"] = np.array([_num(hc.get("CCFWT" + k)) for k in ORDER_KEYS])
         out["ssbz"] = np.array([_num(h0.get("SSBZ" + k)) for k in ORDER_KEYS])
