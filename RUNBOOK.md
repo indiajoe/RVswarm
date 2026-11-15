@@ -295,6 +295,83 @@ scores the RMS of the corrected RVs against a constant.
 
 ## 6. Run the swarm
 
+### 6.0 Short trial run: measure the API cost under a hard cap
+
+`config/trial.yaml` is an overlay on `config/swarm.yaml` that runs **one complete cycle
+at reduced scale** and stops at 270 USD of estimated spending. It needs the API key and
+the orchestrator host only: no cluster, no data store. Evaluation tickets are written
+but nothing has to be submitted.
+
+| | trial | full run |
+|---|---|---|
+| proposers | 4 | 12 |
+| debate rounds | 2 | 5 |
+| ideas implemented | 3 + 1 reference reproduction | 10 (+ 6 reproductions in cycle 1) |
+| literature topics / librarian turns | 2 / 15 | 8 / 40 |
+| implementer turns and fix rounds | full scale | full scale |
+
+Each kind of call runs at full size, so its cost per unit carries over to the full run.
+
+```bash
+cd /path/to/rvswarm
+export ANTHROPIC_API_KEY=sk-ant-...
+export RVSWARM_SWARM_OVERLAY=config/trial.yaml
+
+.venv/bin/python -m swarm.cycle status          # must print limits of 270: the overlay is active
+.venv/bin/python -m swarm.cycle init            # once
+tmux new -s trial
+.venv/bin/python -m swarm.cycle run 2>&1 | tee -a state/trial.log     # ONE cycle, then exits
+```
+
+Use `run`, not `loop`: `loop` would wait for cluster results and start a second cycle.
+While it runs, and afterwards, from another shell (with the same `RVSWARM_SWARM_OVERLAY`):
+
+```bash
+.venv/bin/python -m swarm.cycle status          # phase reached, dollars spent
+.venv/bin/python -m swarm.cycle costs           # spending per kind of call, with USD per unit
+```
+
+Things to know:
+
+* **The cap.** The limit is checked before each call or batch, so work in flight can
+  overshoot by a few dollars; that is why the cap is 270, not 300. The ledger is a local
+  estimate from the price table in `config/swarm.yaml`. The Console usage page is
+  authoritative, and the account balance is the real backstop: make sure auto-reload of
+  credits is off in the Console.
+* **If the cap is reached** the run stops cleanly (`STOPPED: usd_total reached`) and
+  `costs` still reports everything spent up to then.
+* **Duration.** Single-shot phases go through the Batches API (half price). A batch
+  usually returns within an hour but can take up to a day, and the trial submits about
+  eight of them in sequence. For an answer in an hour or two set `api.use_batches: false`
+  in `config/trial.yaml`; then halve the reported cost of the propose, critique, revise,
+  moderate, classify and seminar rows when you extrapolate.
+* **It can be interrupted.** Kill it and run the same command again: it resumes at the
+  phase where it stopped and picks up batches already submitted.
+* **Implementer self-test.** The implement phase runs each new algorithm on the
+  orchestrator host: on your hand-picked frames if `data.toy_l2_dir` is set and
+  `harness.ingest toy` was run (section 4.0), otherwise on the synthetic Sun.
+* **This is the first live run.** Until now the orchestration was only exercised with
+  canned replies. If a phase fails, the error is in `state/trial.log` and the state is
+  saved.
+
+**Scaling the result.** Take `USD/unit` from `costs` and multiply by the number of units
+in a full cycle: 12 proposals; up to 12 x 3 critiques and 12 revisions per debate round,
+times 5 rounds (fewer as proposals settle early: see
+`workspace/proposals/c001/DEBATE_SUMMARY.md`); 2 moderator calls; 10 implementations and
+their reviews. Cycle 1 adds the literature build and 6 reproductions. Later cycles add
+post-mortems (one per finished evaluation, at most 16) and carry more history in each
+prompt, so expect them to cost somewhat more per unit than this first cycle.
+
+**After the trial.** Either keep its output as cycle 1 and continue with the full
+configuration (`unset RVSWARM_SWARM_OVERLAY`, raise nothing: the full limits apply), or
+start clean:
+
+```bash
+cp state/ledger.jsonl ~/trial_ledger.jsonl      # keep the cost record
+rm -rf state/                                   # orchestrator state, tickets, ledger
+git clean -fd workspace/ && git checkout -- workspace/     # agent-written files
+```
+
 ### 6.1 Dry run without spending anything
 
 ```bash
@@ -583,7 +660,9 @@ queries its value erodes; and the ten-centimetre criterion is evaluated on the S
 ## 11. Cost control
 
 * Every API response is priced into `state/ledger.jsonl` using the table in
-  `config/swarm.yaml` (`pricing:` -- check it against current list prices).
+  `config/swarm.yaml` (`pricing:` -- check it against current list prices). Web searches
+  by the librarian are included. `python -m swarm.cycle costs` prints the spending per
+  kind of call and per unit; section 6.0 describes a capped trial run for measuring it.
 * Three hard limits: `budget.usd_per_cycle`, `usd_per_month`, `usd_total`. When one is
   reached the orchestrator stops cleanly and can be resumed after you raise it.
 * Single-shot phases (propose, critique, revise, moderate, post-mortem, classify,

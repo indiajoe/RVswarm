@@ -1,0 +1,46 @@
+# =============================================================================
+# SHORT TRIAL RUN -- one complete cycle at reduced scale under a hard spending cap,
+# to measure what each kind of agent call costs.  Overlays config/swarm.yaml:
+#
+#     export RVSWARM_SWARM_OVERLAY=config/trial.yaml
+#
+# Keys given here replace those of swarm.yaml (lists are replaced whole).
+# Unset the variable to return to the full configuration.  See RUNBOOK section 6.0.
+# =============================================================================
+budget:
+  # The account holds 300 USD.  The cap is checked BEFORE each call or batch, so work
+  # already in flight can overshoot by a few dollars: 270 leaves that margin.
+  usd_per_cycle: 270
+  usd_per_month: 270
+  usd_total: 270
+
+api:
+  use_batches: true          # keep true: it is what the real run will use (half price).
+                             # false = results in minutes instead of up to hours, but the
+                             # single-shot phases then cost twice what the real run will.
+
+cycle:
+  debate_rounds: 2           # full run: 5
+  select_per_cycle: 3        # full run: 10
+  wildcard_slots: 1
+  seminar_topics: 1
+  max_postmortems_per_cycle: 4
+  # implement_max_turns and implement_fix_rounds are left at full scale on purpose:
+  # one implementation must cost here what it will cost in the real run.
+
+# 4 of the 12 proposers, chosen to span personas, knowledge slices and data views
+proposer_slots:
+  - {id: P01, persona: solar_physicist,        knowledge: full, view: spectra}
+  - {id: P07, persona: exoplanet_rv,           knowledge: none, view: ccf_and_indices}
+  - {id: P10, persona: ml_researcher,          knowledge: B,    view: spectra}
+  - {id: P11, persona: signal_outsider,        knowledge: none, view: any}
+
+# 1 of the 6 reference reproductions
+bootstrap_reproductions:
+  - "SCALPELS (Collier Cameron et al. 2021): time-domain projection of RVs onto CCF autocorrelation shape components"
+
+literature:
+  max_tool_turns: 15         # full run: 40
+  topics:
+    - "CCF-shape methods: SCALPELS, FIESTA, CCF PCA, bisector / skew-normal indicators"
+    - "Line-by-line and line-selection methods; formation-depth / temperature-binned RVs; Zeeman-sensitive lines; pairwise GP on lines"
