@@ -12,6 +12,7 @@ An algorithm lives in `workspace/algorithms/<alg_id>/`:
 | `SPEC.md` | the approved proposal the code implements (written by the proposer) |
 | `algorithm.py` | must define `run(ctx)`; may import sibling `.py` files in the same directory |
 | `algorithm.yaml` | name, family, resource request (below) |
+| `native/` (optional) | C, C++, Fortran or Julia sources called from `algorithm.py` (section 5a) |
 | `IMPLEMENTATION_NOTES.md` | what was built, every deviation from the spec and why |
 
 ```yaml
@@ -60,6 +61,7 @@ A real planet's Doppler signal must survive in it.
 | `ctx.time_budget_s`, `ctx.elapsed()` | wall-time budget for this run and seconds used so far. Exceeding it kills the run. |
 | `ctx.seed` | integer; use it for all random number generators (identical across runs) |
 | `ctx.scratch_file(name)` | path string of a private scratch file (flat names like `"feat.npy"`); use with `np.save`, `np.load`, `np.memmap`, `torch.save`. Wiped after the run. |
+| `ctx.native_library(openmp=False, flags=())`, `ctx.native_file(name)` | compiled-language support, section 5a |
 | `ctx.log(*parts)` | progress message (the log tail of the un-injected dev run is shown in the result report) |
 | `ctx.metric(name, value)` | record a scalar intermediate check; printed in the result report |
 | `ctx.diagnostic(name, array)` | record a small array (periodogram, eigen-spectrum, coefficients...); summarised in the report. 20 MB total. |
@@ -115,8 +117,19 @@ only the orders you need and cache derived features with `ctx.scratch_file`.
   dataclasses, typing, functools, itertools, collections, time, warnings, json,
   logging, random, statistics, heapq, bisect, copy, enum, abc, re, string, datetime,
   concurrent, multiprocessing, threading, queue, numbers, contextlib,
-  hashlib. Ask for additions through `workspace/diagnostic_requests/`.
-* Not allowed: `os`, `sys`, `subprocess`, `pathlib`, `open`, `eval`, `exec`,
+  hashlib, textwrap, fractions, decimal.
+* **More packages are available on request.** If a well-known astronomy or data-science
+  package (or a compiled language, section 5a) would let a method be implemented better,
+  list its import name under `requires:` in the proposal front matter. The human
+  maintainers install it; a selected specification waits in
+  `workspace/environment_requests/PENDING.md` until then and is implemented
+  automatically afterwards. Do not distort a method to fit the default list.
+* `astropy.io`, `scipy.io`, `pandas.io` and similar file readers are excluded on purpose:
+  an algorithm never opens the FITS files. The harness reads them and hands over the
+  data through `SolarDataset`, already carrying the hidden planets; direct file access
+  would bypass that. Everything in the L2 files is reachable through `SolarDataset`; if
+  something is missing, ask for it in `workspace/diagnostic_requests/`.
+* Not allowed in Python code: `os`, `sys`, `subprocess`, `pathlib`, `open`, `eval`, `exec`,
   `getattr`/`setattr`, `vars`, `globals`, dunder attributes other than `__init__`-style
   methods, private attributes (`._x`) of objects other than `self`, path-like string
   literals, network access, reading any file other than your own scratch files.
@@ -127,6 +140,41 @@ only the orders you need and cache derived features with `ctx.scratch_file`.
   citation, and textbook ephemeris formulae are fine.
 * No hard-coded dates, observation ids or per-epoch corrections. The same code
   must work on any time span of this instrument.
+
+## 5a. Other languages: C, C++, Fortran, Julia
+
+The entry point is always `run(ctx)` in `algorithm.py`, which reads the data through
+`SolarDataset` and returns the result. **Python is the preferred language**: use
+another one only for a numerical core that would be significantly slower in Python
+(NumPy, Numba, JAX, PyTorch), and say why in the specification or the notes. Such a
+core may then be written in C, C++, Fortran or Julia. Put the sources, flat, in `native/` (`.c .h .cpp .hpp .f90 .f .jl`; no
+binaries, no build scripts). Native code receives NumPy arrays from `algorithm.py` and
+must not touch files, processes, the network or environment variables itself.
+
+**C, C++, Fortran.** `lib = ctx.native_library(openmp=False, flags=())` compiles every
+source in `native/` into one shared library (`cc` / `c++` / `gfortran`, `-O2 -fPIC
+-shared`, plus `-fopenmp` on request) and returns a `ctypes.CDLL`. Optional `flags` from:
+`-O3 -ffast-math -march=native -funroll-loops -std=c11 -std=c99 -std=c++17 -std=f2008
+-llapack -lblas -lfftw3 -lgsl -lgslcblas`. `import ctypes` and `numpy.ctypeslib` are
+allowed in `algorithm.py` when `native/` exists. Export C-callable symbols (`extern "C"`
+in C++, `bind(C)` in Fortran):
+
+```python
+import ctypes, numpy as np
+def run(ctx):
+    lib = ctx.native_library(openmp=True)
+    vec = np.ctypeslib.ndpointer(dtype=np.float64, ndim=1, flags="C_CONTIGUOUS")
+    lib.my_kernel.argtypes = [vec, vec, ctypes.c_int]; lib.my_kernel.restype = ctypes.c_double
+    ...
+```
+
+**Julia.** `from juliacall import Main as jl`, then
+`jl.include(ctx.native_file("model.jl"))` and call the Julia functions with NumPy
+arrays. Julia packages beyond the standard library must be requested (`requires:`).
+
+Which languages are enabled is decided by the human maintainers; the audit reports a
+language that is not enabled, and it can be requested like a package. The toy self-test
+(`run_tests`) builds and runs native code exactly as the cluster does.
 
 ## 6. How an evaluation is scored (fixed; proposers and implementers have no say)
 

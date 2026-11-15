@@ -447,9 +447,26 @@ audit. Agents cannot read that directory.
 * **Force an idea into the next cycle**: name the file `PRIORITY_my_idea.md`. It is
   turned into a full specification, reviewed, implemented and evaluated outside the
   10-idea quota.
-* **Add a diagnostic or a library**: read `workspace/diagnostic_requests/`. To allow a
-  package, add it to `audit.allowed_imports` in `config/harness.yaml` and to the
-  cluster environment, and mention it in `workspace/docs/ALGORITHM_INTERFACE.md`.
+* **Add a diagnostic**: read `workspace/diagnostic_requests/`.
+* **Add a package the agents asked for**: read `workspace/environment_requests/PENDING.md`.
+  A proposal lists what it needs under `requires:`; if selected, it waits there instead
+  of being implemented. Install the package in the cluster environment, in the sandbox
+  container, and on the orchestrator host (the implementer's toy self-test runs there),
+  then add its **import name** to `audit.allowed_imports` in `config/harness.yaml`. The
+  waiting specification is implemented in the next cycle. If the agent wrote a pip name
+  that differs from the import name (`PyWavelets` vs `pywt`), adding that name to the
+  list as well releases it. Keep file-reading modules out (`astropy.io`, `scipy.io`,
+  `pandas.io` are in `forbidden_submodules`): algorithms get all data through the
+  harness, which is what keeps the planet injection blind.
+* **Other languages**: Python is the preferred language and the agents are told to
+  leave it only for a significant speed gain. Algorithms may then carry C, C++, Fortran or Julia sources in
+  `native/`, compiled inside each run by `ctx.native_library()` (or loaded through
+  `juliacall`). `audit.native.languages` lists what is enabled; keep only languages
+  whose toolchain exists in all three places above (`cc`, `c++`, `gfortran`, `julia` +
+  `juliacall`), and make sure the per-run work directory is not mounted `noexec`.
+  Native code cannot be audited statically: the audit only screens the sources for
+  obvious file, process and network calls, so the container wrapper (section 10) is the
+  real barrier. Only the C route has been tested (no Fortran or Julia here).
 * **Tell the agents something about the data**: edit
   `workspace/docs/DATA_DESCRIPTION.md`. Every agent reads it every cycle.
 * **Change the panel**: edit `proposer_slots` (add, remove, re-role). A slot's history
