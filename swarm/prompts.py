@@ -341,10 +341,16 @@ def implement_prompt(alg_id: str, parents: list[str]) -> str:
             "- The evaluation is fixed and you cannot see the real data. Do not add anything whose purpose is "
             "to do well on the score rather than to implement the method; in particular nothing that fits "
             "free functions of time unless the specification's mechanism calls for it.\n\n"
-            "Use `run_tests` to check your work on the toy data until it completes without error. The toy Sun "
-            "is not realistic, so do not tune the method to it; do make sure injected planets survive there "
-            "(transfer near 1) unless the notes explain why the toy is misleading for this method. When you "
-            "are done, reply with a three-line summary.")
+            "Use `run_tests` to check your work until it completes without error. The orchestrator host has "
+            "little compute, so the local test data is deliberately tiny: normally about five real NEID "
+            "spectra (the report then says 'Smoke test'). That proves only that the code runs on real data, "
+            "so your code MUST run without crashing when `n_obs` is that small (clip ranks and component "
+            "counts to the data, fall back to the pipeline RV where a model cannot be fitted) and must not "
+            "be tuned to those few spectra. Compare the last two columns of the smoke table: for a method "
+            "that preserves planets the change in your output follows the injected shift. If instead the "
+            "report is for the synthetic toy Sun, make sure injected planets survive there (transfer near 1) "
+            "unless the notes explain why the toy is misleading for this method. When you are done, reply "
+            "with a three-line summary.")
 
 
 REVIEW_SCHEMA = {

@@ -50,8 +50,10 @@ class Toolset:
         ]
         if self.allow_tests:
             d.append({"name": "run_tests", "description": "Run the static code audit and then your algorithm "
-                      "end-to-end on the toy synthetic Sun (un-injected + one hidden-planet run), exactly as "
-                      "the real harness would. Returns the audit result, the result report and the log tail. "
+                      "end-to-end on the local test data (un-injected + one injected run), exactly as "
+                      "the real harness would. The test data is either about five real NEID spectra (a smoke "
+                      "test: does the code run on real data?) or a small synthetic Sun; the report says which. "
+                      "Returns the audit result, the result report and the log tail. "
                       "Takes a few minutes for heavy algorithms.", "input_schema": _schema({}, [])})
         return d
 

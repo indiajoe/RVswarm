@@ -1,7 +1,7 @@
 """Evaluate one algorithm at one stage. This is what a SLURM job runs.
 
     python -m harness.evaluate --alg <alg_id> --stage screen|full|sealed
-    python -m harness.evaluate --alg-dir path/to/dir --stage toy      # synthetic data, local
+    python -m harness.evaluate --alg-dir path/to/dir --stage toy      # local: a few real frames, or synthetic
 
 The algorithm is run once without and n times with hidden injected planets, each
 in a fresh process. Results go to workspace/results/<alg_id>/<stage>_<NN>/.
@@ -103,6 +103,19 @@ def write_report(out: Path, alg_id: str, stage: str, m: dict, man: dict, runs: l
          f"- status: **{m.get('status')}**"]
     if m.get("status") != "ok":
         L += ["", "## Failure", "```", str(m.get("error", ""))[-3500:], "```"]
+    elif m.get("smoke"):
+        L += ["", "## Smoke test on a few real NEID spectra", "",
+              f"The algorithm ran on {m['n_obs']} real, hand-picked spectra, once as they are and once with "
+              "small Doppler shifts injected. This only shows that the code runs on real data and what "
+              "it returns. There are far too few spectra to measure scatter or planet preservation; "
+              "those are measured on the cluster. A method that needs many spectra to train must still "
+              "run here without crashing (reduce its rank, or fall back, when `n_obs` is tiny).", "",
+              f"- finite outputs: {m['valid_fraction']:.2f} of observations", "",
+              "| time (d) | pipeline RV (m/s) | your corrected RV (m/s) | injected shift (m/s) | change in your output (m/s) |",
+              "|---|---|---|---|---|"]
+        L += ["| " + " | ".join(f"{x:.4f}" for x in row) + " |" for row in m["smoke_rows"]]
+        L += ["", "For a method that preserves planets, the last two columns agree, apart from whatever "
+              "the method legitimately cannot determine from so few spectra (for example a constant offset)."]
     else:
         L += [f"- observations scored: {m['n_obs']} on {m['n_days']} days "
               f"(baseline {m['baseline_days']:.0f} d)", "",
@@ -236,7 +249,17 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
                        "Algorithm code must run inside a container that cannot read the harness secrets. "
                        "See RUNBOOK section 10, or set RVSWARM_ALLOW_UNSANDBOXED=1 to accept the risk."})
 
+    smoke = False
     if stage == "toy":
+        toy_dir = cfg["data"].get("toy_l2_dir")
+        if backend_spec is None and toy_dir and os.environ.get("RVSWARM_TOY") != "synth":
+            # a handful of real, hand-picked frames: does the code run on real data?
+            if not (Path(cfg["data"]["toy_store_dir"]) / "manifest.json").exists():
+                return finish({"status": "no_toy_store", "gate_pass": False, "error":
+                               "HARNESS CONFIGURATION (not an algorithm fault): data.toy_l2_dir is set "
+                               "but its store is missing. Run: python -m harness.ingest toy"})
+            backend_spec = {"kind": "store", "store_dir": cfg["data"]["toy_store_dir"], "l2_dir": toy_dir}
+            smoke = True
         backend_spec = backend_spec or TOY_BACKEND
         stage_cfg = {"n_injections": 1}
         hours = min(res["hours"], 0.5)
@@ -296,6 +319,21 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
 
     if runs[0]["status"] != "ok":
         result = finish({"status": "run_failed", "error": runs[0]["error"], "gate_pass": False})
+    elif smoke:
+        # Too few spectra for any statistic: report only whether the code ran and what it returned.
+        c0, r1 = runs[0]["rv_clean"], runs[1]
+        m = {"smoke": True, "n_obs": int(index.size), "gate_pass": True, "gate_reasons": [],
+             "valid_fraction": float(np.isfinite(c0).mean()),
+             "smoke_rows": [[float(x) for x in row] for row in zip(
+                 t - t0, be.rv[index], c0,
+                 plans[1]["truth"], (r1["rv_clean"] - c0) if r1["status"] == "ok" else np.full(index.size, np.nan))]}
+        if r1["status"] != "ok":
+            m.update(status="run_failed", gate_pass=False,
+                     error="the run with injected planets failed:\n" + r1["error"][-3000:])
+        elif not np.isfinite(c0).any():
+            m.update(gate_pass=False, gate_reasons=["no finite output"])
+        m["algorithm_metrics"] = runs[0]["metrics"]
+        result = finish(m)
     else:
         injected = [{"rv_clean": r["rv_clean"], "planets": p["planets"], "truth": p["truth"]}
                     for r, p in zip(runs[1:], plans[1:]) if r["status"] == "ok"]

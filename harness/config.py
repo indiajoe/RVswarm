@@ -26,7 +26,10 @@ def load() -> dict:
         d["l2_dir"] = os.environ["NEID_DATA_DIR"]
     if os.environ.get("RVSWARM_STORE"):
         d["store_dir"] = os.environ["RVSWARM_STORE"]
-    for key in ("store_dir", "sample_store_dir"):
+    if os.environ.get("RVSWARM_TOY_DATA_DIR"):
+        d["toy_l2_dir"] = os.environ["RVSWARM_TOY_DATA_DIR"]
+    d.setdefault("toy_store_dir", "data_store/toy")
+    for key in ("store_dir", "sample_store_dir", "toy_store_dir"):
         p = Path(d[key])
         d[key] = str(p if p.is_absolute() else ROOT / p)
     return cfg

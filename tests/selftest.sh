@@ -2,6 +2,7 @@
 # Harness self-test on the toy Sun: honest methods pass, cheaters are caught.
 # Usage: tests/selftest.sh     (takes a few minutes; needs no data and no API key)
 set -u
+export RVSWARM_TOY=synth        # always the synthetic Sun here, even if real toy frames are configured
 source "$(dirname "$0")/../bin/_common.sh"
 OUT="${TMPDIR:-/tmp}/rvswarm_selftest_$$"
 fail=0
