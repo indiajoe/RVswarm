@@ -21,3 +21,6 @@ jax
 jaxopt
 optax
 torch          # install the build matching your cluster's CUDA
+
+# Optional: only if Julia is enabled in audit.native.languages (needs a Julia install)
+# juliacall

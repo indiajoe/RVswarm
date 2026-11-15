@@ -86,6 +86,10 @@ family_hint: <one phrase naming the kind of approach>
 parents: []            # ids of earlier algorithms this builds on, if any
 uses: [ccf]            # any of: spectra, ccf, order_rv, indices, telemetry, time
 resources: {cpus: 8, mem_gb: 64, gpus: 0, hours: 4}
+language: python       # python is preferred; add c / cpp / fortran / julia only for a core that is
+                       # significantly too slow in NumPy / Numba / JAX / PyTorch
+requires: []           # import names of packages, or languages, beyond those listed in ALGORITHM_INTERFACE.md
+                       # section 5. The humans will install what a selected idea needs; until then it waits.
 predicted:             # pre-registered, for the FULL development data
   rms_null_daily_ms: <number>
   min_transfer: <number>
@@ -104,7 +108,11 @@ with expected sizes of effects.
 Numbered steps precise enough that a careful programmer who cannot ask you questions will build \
 what you mean: inputs (exact `SolarDataset` members), every transformation with formulae, every \
 hyper-parameter with its value and how it was chosen, numerical details that matter, outputs. \
-Say how it scales to ~10^5 observations within the resource request.
+Say how it fits the resource request. If the method would be clearer, faster or only practical \
+with a package that is not on the allow-list, say so and list it under `requires` -- do not bend \
+the method to fit the default environment. Python is the preferred language: ask for a core in C, \
+C++, Fortran or Julia only when Python (NumPy, Numba, JAX, PyTorch) would be significantly slower, \
+and say why.
 
 ## 4. Why planets survive
 The argument that a pure Doppler shift of the whole spectrum passes through with unit gain at \
@@ -313,7 +321,11 @@ def implement_prompt(alg_id: str, parents: list[str]) -> str:
             "reference implementations `algorithms/baseline_*/` (useful as working examples of the interface). "
             + extra +
             "\nDeliver, in your directory:\n"
-            "- `algorithm.py` (plus helper modules if useful) implementing `run(ctx)` per the interface;\n"
+            "- `algorithm.py` (plus helper modules if useful) implementing `run(ctx)` per the interface. "
+            "Write it in Python unless that is significantly slower: only when the specification calls for "
+            "it, or vectorised NumPy / Numba / JAX / PyTorch cannot make the numerical core fast enough, put "
+            "C, C++, Fortran or Julia sources in `native/` and call them from `algorithm.py` (interface "
+            "section 5a), and record the reason in the notes;\n"
             "- `algorithm.yaml` with name, family and the resource request from the specification;\n"
             "- `IMPLEMENTATION_NOTES.md`: what you built, every deviation from the specification with the "
             "reason, known weaknesses, and anything the proposer should know when reading results.\n\n"

@@ -26,6 +26,7 @@ from pathlib import Path
 import anthropic
 import yaml
 
+from harness import config as hconfig
 from harness import promote
 
 from . import prompts, registry
@@ -438,6 +439,8 @@ class Cycle:
         p["predicted"] = fm.get("predicted", p.get("predicted"))
         par = fm.get("parents") or []
         p["parents"] = [str(x) for x in par if str(x) in self.reg["proposals"]] if isinstance(par, list) else []
+        req = fm.get("requires") or []
+        p["requires"] = [str(x) for x in (req if isinstance(req, list) else [req])]
         p["status"] = "specified"
 
     def debate(self) -> None:
@@ -628,7 +631,27 @@ class Cycle:
         for p in sorted(alg_dir.iterdir()):
             if p.suffix in (".py", ".yaml", ".md") and p.name not in ("SPEC.md", "REVIEW.md"):
                 parts.append(f"===== {p.name} =====\n{read(p, 60000)}")
+        if (alg_dir / "native").is_dir():
+            for p in sorted((alg_dir / "native").iterdir()):
+                if p.is_file():
+                    parts.append(f"===== native/{p.name} =====\n{read(p, 60000)}")
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _missing_requirements(p: dict) -> list[str]:
+        """Packages / languages a specification needs that the cluster environment does not offer yet."""
+        a = hconfig.load()["audit"]
+        nat = a.get("native") or {}
+        have = {str(x).lower() for x in a["allowed_imports"]} | {str(x).lower() for x in nat.get("languages", [])} \
+            | {str(x).lower() for x in nat.get("extra_imports", [])} | {"python", "c++"}
+        if "cpp" not in have:
+            have.discard("c++")
+        out = []
+        for r in p.get("requires") or []:
+            name = re.split(r"[\s<>=!~\[(]", str(r).strip().lower(), 1)[0].replace("-", "_")
+            if name and name not in have and name.split(".")[0] not in have:
+                out.append(str(r))
+        return out
 
     def _implement_one(self, pid: str) -> str:
         p = self.reg["proposals"][pid]
@@ -698,7 +721,32 @@ class Cycle:
         mf.write_text(yaml.safe_dump(man, sort_keys=False))
 
     def implement(self) -> None:
-        todo = [pid for pid, p in self.reg["proposals"].items() if p.get("selected") and p.get("status") == "selected"]
+        todo, waiting = [], []
+        for pid, p in self.reg["proposals"].items():      # includes earlier cycles' specs that were waiting
+            if not p.get("selected") or p.get("status") not in ("selected", "waiting_for_environment"):
+                continue
+            miss = self._missing_requirements(p)
+            if miss:
+                p["status"] = "waiting_for_environment"
+                waiting.append((pid, miss))
+            else:
+                p["status"] = "selected"
+                todo.append(pid)
+        d = WORKSPACE / "environment_requests"
+        d.mkdir(exist_ok=True)
+        L = ["# Environment requests (for the human who maintains the cluster environment)", "",
+             "_Generated each cycle. A specification listed here is selected but NOT implemented until what "
+             "it needs is available: install it in the cluster environment (and the sandbox container, and "
+             "the orchestrator host for the toy self-test), then add the import name to "
+             "`audit.allowed_imports`, or the language to `audit.native.languages`, in `config/harness.yaml`. "
+             "It is then implemented in the next cycle automatically._", ""]
+        L += [f"- `{pid}` ({self.reg['proposals'][pid].get('title', '')[:70]}) needs: **{', '.join(m)}**"
+              for pid, m in waiting] or ["Nothing is waiting."]
+        (d / "PENDING.md").write_text("\n".join(L) + "\n")
+        self.save()
+        if waiting:
+            log(f"implement: {len(waiting)} specification(s) waiting for environment: "
+                + ", ".join(f"{pid} [{', '.join(m)}]" for pid, m in waiting))
         if not todo:
             return
         with ThreadPoolExecutor(self.cfg["api"]["max_concurrency"]) as ex:
@@ -852,7 +900,7 @@ def hold_reason(cfg: dict, st: dict) -> str | None:
 
 def init() -> None:
     for d in ("docs", "literature", "proposals", "selected", "algorithms", "results", "postmortems", "registry",
-              "human_suggestions", "diagnostic_requests", "digests", "agents", "crosspollination", "seminars"):
+              "human_suggestions", "diagnostic_requests", "environment_requests", "digests", "agents", "crosspollination", "seminars"):
         (WORKSPACE / d).mkdir(parents=True, exist_ok=True)
     readme = WORKSPACE / "human_suggestions" / "README.md"
     if not readme.exists():
