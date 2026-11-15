@@ -13,6 +13,7 @@ import argparse
 import difflib
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -46,8 +47,24 @@ def log(*a) -> None:
     print(time.strftime("[%m-%d %H:%M:%S]"), *a, flush=True)
 
 
+def _merge(base: dict, over: dict) -> dict:
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _merge(base[k], v)
+        else:
+            base[k] = v                                   # lists and scalars are replaced whole
+    return base
+
+
 def load_cfg() -> dict:
-    return yaml.safe_load((ROOT / "config" / "swarm.yaml").read_text())
+    """config/swarm.yaml, optionally overlaid by the file named in $RVSWARM_SWARM_OVERLAY
+    (for example config/trial.yaml: a small, capped trial run)."""
+    cfg = yaml.safe_load((ROOT / "config" / "swarm.yaml").read_text())
+    over = os.environ.get("RVSWARM_SWARM_OVERLAY")
+    if over:
+        p = Path(over)
+        _merge(cfg, yaml.safe_load((p if p.is_absolute() else ROOT / p).read_text()) or {})
+    return cfg
 
 
 def load_state() -> dict:
@@ -941,15 +958,43 @@ def status() -> None:
     print(read(lb, 6000))
 
 
+def costs() -> None:
+    """Spending by kind of call, from state/ledger.jsonl: the basis for scaling up."""
+    rows = [json.loads(l) for l in read(STATE / "ledger.jsonl", 10**9).splitlines() if l.strip()]
+    if not rows:
+        print("no API calls recorded yet")
+        return
+    agg: dict = {}
+    for r in rows:
+        a = agg.setdefault((r["cycle"], r["role"], r["model"]), {"calls": 0, "tags": set(), "in": 0, "out": 0,
+                                                                 "cr": 0, "cw": 0, "ws": 0, "usd": 0.0})
+        a["calls"] += 1
+        a["tags"].add(r["tag"])
+        for k, f in (("in", "in"), ("out", "out"), ("cr", "cache_read"), ("cw", "cache_write"), ("ws", "web_searches")):
+            a[k] += r.get(f, 0)
+        a["usd"] += r["usd"]
+    print("'units' = distinct jobs (one proposal, one critique, one implementation ...); 'USD/unit' is what to scale.")
+    print(f"{'cycle':>5} {'role':<15} {'model':<19} {'calls':>6} {'units':>6} {'in kTok':>9} {'cache-rd kTok':>13} "
+          f"{'cache-wr kTok':>13} {'out kTok':>9} {'searches':>8} {'USD':>9} {'USD/unit':>9}")
+    for (cyc, role, model), a in sorted(agg.items(), key=lambda kv: (kv[0][0], -kv[1]["usd"])):
+        n = len(a["tags"])
+        print(f"{cyc:>5} {role:<15} {model:<19} {a['calls']:>6} {n:>6} {a['in']/1e3:>9.1f} {a['cr']/1e3:>13.1f} "
+              f"{a['cw']/1e3:>13.1f} {a['out']/1e3:>9.1f} {a['ws']:>8} {a['usd']:>9.2f} {a['usd']/n:>9.2f}")
+    print(f"total: ${sum(a['usd'] for a in agg.values()):.2f} in {len(rows)} calls "
+          "(local estimate from config/swarm.yaml prices; the Console usage page is authoritative)")
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["init", "run", "loop", "status"])
+    ap.add_argument("cmd", choices=["init", "run", "loop", "status", "costs"])
     ap.add_argument("--only", choices=PHASES)
     a = ap.parse_args(argv)
     if a.cmd == "init":
         return init()
     if a.cmd == "status":
         return status()
+    if a.cmd == "costs":
+        return costs()
     try:
         if a.cmd == "run":
             Cycle().run(a.only)

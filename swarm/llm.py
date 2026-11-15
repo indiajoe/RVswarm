@@ -51,10 +51,13 @@ class Ledger:
                + g("cache_creation_input_tokens") * p["cache_write"]) / 1e6
         if batch:
             usd *= 0.5
+        stu = getattr(usage, "server_tool_use", None)
+        searches = int(getattr(stu, "web_search_requests", 0) or 0) if stu is not None else 0
+        usd += searches * float(self.pricing.get("web_search_per_1000", 10.0)) / 1000.0
         row = {"t": time.strftime("%Y-%m-%dT%H:%M:%S"), "cycle": cycle, "role": role, "tag": tag,
                "model": model, "in": g("input_tokens"), "out": g("output_tokens"),
                "cache_read": g("cache_read_input_tokens"),
-               "cache_write": g("cache_creation_input_tokens"), "usd": round(usd, 5), "batch": batch}
+               "cache_write": g("cache_creation_input_tokens"), "web_searches": searches, "usd": round(usd, 5), "batch": batch}
         with self._lock, open(self.path, "a") as fh:
             fh.write(json.dumps(row) + "\n")
         return usd
