@@ -81,4 +81,13 @@ audit:
                     numbers, contextlib, textwrap, hashlib, fractions, decimal]
   forbidden_submodules: [astropy.io, numpy.ctypeslib, torch.hub, torch.utils.cpp_extension,
                          scipy.io, pandas.io, joblib.externals, multiprocessing.shared_memory]
+  # Compiled / other-language code. An algorithm may ship sources in <alg>/native/ and call them
+  # from algorithm.py (ctx.native_library() for C, C++, Fortran; juliacall for Julia).
+  # List only languages whose toolchain is installed in the cluster environment AND in the
+  # sandbox container (cc, c++, gfortran, julia + the juliacall package). [] disables native code.
+  # Native code cannot be audited statically: the container is what confines it.
+  native:
+    languages: [c, cpp, fortran, julia]
+    extra_imports: [ctypes, juliacall]      # allowed in algorithm.py only when native/ exists
+    max_source_bytes: 2000000
   max_diagnostic_bytes: 20000000

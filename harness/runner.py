@@ -6,9 +6,11 @@ Invoked only by harness.evaluate. Builds the (possibly injected) dataset, calls
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -24,7 +26,7 @@ class Context:
     """Passed to `run(ctx)`. See workspace/docs/ALGORITHM_INTERFACE.md."""
 
     def __init__(self, target, scratch: Path, n_cpus: int, gpu: bool, time_budget_s: float,
-                 seed: int, max_diag_bytes: int):
+                 seed: int, max_diag_bytes: int, alg_dir: Path | None = None):
         self.target = target
         self.n_cpus = n_cpus
         self.gpu = gpu
@@ -59,6 +61,51 @@ class Context:
         def elapsed() -> float:
             return time.time() - t0
 
+        native = (Path(alg_dir) / "native") if alg_dir else None
+        libs: dict = {}
+
+        def native_file(name: str) -> str:
+            """Path of a source file in the algorithm's native/ directory (e.g. a Julia script to include)."""
+            p = native / str(name) if native else None
+            if p is None or not p.is_file() or p.parent != native:
+                raise FileNotFoundError(f"native/{name} does not exist")
+            return str(p)
+
+        def native_library(openmp: bool = False, flags=()):
+            """Compile every C / C++ / Fortran source in native/ into one shared library (fixed
+            compiler and options) and return it as a ctypes.CDLL. Built once per run."""
+            key = (bool(openmp), tuple(flags))
+            if key in libs:
+                return libs[key]
+            if native is None or not native.is_dir():
+                raise FileNotFoundError("the algorithm has no native/ directory")
+            ok_flags = {"-O3", "-ffast-math", "-march=native", "-funroll-loops", "-std=c11", "-std=c99",
+                        "-std=c++17", "-std=f2008", "-llapack", "-lblas", "-lgomp", "-lfftw3", "-lgsl", "-lgslcblas"}
+            bad = [f for f in flags if f not in ok_flags]
+            if bad:
+                raise ValueError(f"compiler flags not allowed: {bad}; allowed: {sorted(ok_flags)}")
+            src = sorted(p for p in native.iterdir() if p.suffix.lower() in
+                         (".c", ".cpp", ".cc", ".cxx", ".f90", ".f95", ".f03", ".f08", ".f", ".for"))
+            if not src:
+                raise FileNotFoundError("native/ holds no C, C++ or Fortran source")
+            has_f = any(p.suffix.lower().startswith(".f") for p in src)
+            has_cpp = any(p.suffix.lower() in (".cpp", ".cc", ".cxx") for p in src)
+            if has_f and has_cpp:
+                raise ValueError("mixing Fortran and C++ in one library is not supported")
+            cc = "gfortran" if has_f else ("c++" if has_cpp else "cc")
+            out = scratch / f"libnative_{len(libs)}.so"
+            libflags = [f for f in flags if f.startswith("-l")]
+            cmd = ([cc, "-O2", "-fPIC", "-shared", "-I", str(native)] + (["-fopenmp"] if openmp else [])
+                   + [f for f in flags if not f.startswith("-l")] + ["-o", str(out)] + [str(p) for p in src]
+                   + libflags + ["-lm"])
+            pr = subprocess.run(cmd, capture_output=True, text=True, cwd=str(scratch))
+            if pr.returncode != 0:
+                raise RuntimeError(f"native build failed ({cc}):\n" + (pr.stderr or pr.stdout)[-3000:])
+            log(f"native library built with {cc} from {[p.name for p in src]}")
+            libs[key] = ctypes.CDLL(str(out))
+            return libs[key]
+
+        self.native_file, self.native_library = native_file, native_library
         self.scratch_file, self.log, self.metric, self.diagnostic = scratch_file, log, metric, diagnostic
         self.elapsed = elapsed
         self.collected = lambda: (dict(metrics), dict(diags))
@@ -94,7 +141,8 @@ def main(argv=None) -> None:
     del shift, be
     Path(a.scratch).mkdir(parents=True, exist_ok=True)
     ctx = Context(ds, Path(a.scratch), a.cpus, bool(a.gpu), a.time_budget_s,
-                  seed=int(view.get("alg_seed", 0)), max_diag_bytes=int(view["max_diag_bytes"]))
+                  seed=int(view.get("alg_seed", 0)), max_diag_bytes=int(view["max_diag_bytes"]),
+                  alg_dir=Path(a.alg_dir).resolve())
 
     for k in list(os.environ):                              # nothing harness-related in the env
         if k.startswith(("RVSWARM", "NEID", "ANTHROPIC", "SLURM_JOB_NAME")):

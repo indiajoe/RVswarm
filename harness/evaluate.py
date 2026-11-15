@@ -77,9 +77,9 @@ def partition(be, cfg: dict, stage: str):
 
 def _sha_dir(d: Path) -> str:
     h = hashlib.sha256()
-    for p in sorted(d.glob("*")):
-        if p.is_file():
-            h.update(p.name.encode())
+    for p in sorted(d.rglob("*")):
+        if p.is_file() and "__pycache__" not in p.parts:
+            h.update(str(p.relative_to(d)).encode())
             h.update(p.read_bytes())
     return h.hexdigest()[:16]
 

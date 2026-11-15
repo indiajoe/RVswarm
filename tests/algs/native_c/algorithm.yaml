@@ -1,0 +1,3 @@
+name: native C self-test
+family: F03
+resources: {cpus: 2, mem_gb: 4, gpus: 0, hours: 0.2}

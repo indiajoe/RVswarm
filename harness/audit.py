@@ -9,8 +9,59 @@ processes, introspection). For hard isolation also set RVSWARM_SANDBOX_CMD.
 from __future__ import annotations
 
 import ast
+import re
 import sys
 from pathlib import Path
+
+# Source files allowed in <alg>/native/, by language (config: audit.native.languages).
+NATIVE_EXT = {"c": (".c", ".h"), "cpp": (".cpp", ".cc", ".cxx", ".hpp", ".hh"),
+              "fortran": (".f90", ".f95", ".f03", ".f08", ".f", ".for"), "julia": (".jl",)}
+# Coarse text screen of native sources. Compiled code cannot be audited statically; this only
+# catches the obvious. The container (RVSWARM_SANDBOX_CMD) is what actually confines it.
+_C_BAD = re.compile(r"\b(fopen|freopen|fdopen|open|openat|creat|popen|system|exec[lv]p?e?|fork|vfork|socket|"
+                    r"connect|dlopen|getenv|opendir|readlink|remove|rename|unlink|mmap)\s*\(|"
+                    r"#\s*include\s*[<\"](sys/socket|netinet/|arpa/|netdb|dirent|dlfcn|fstream|filesystem|curl/)")
+_F_BAD = re.compile(r"(?i)\b(open|inquire)\s*\(|execute_command_line|call\s+system|get_environment_variable|\bgetenv\b")
+_J_BAD = re.compile(r"\b(open|run|download|read|readlines|readdir|write|rm|mv|cp|mkdir|cd|pwd|ccall|eval|"
+                    r"include_string|pipeline|Cmd|connect|listen)\s*\(|@ccall|@cmd|\bENV\b|\bLibc\b|\bSockets\b|"
+                    r"\bDownloads\b|\bPkg\b|`")
+
+
+def _lang_of(path: Path) -> str | None:
+    for lang, exts in NATIVE_EXT.items():
+        if path.suffix.lower() in exts:
+            return lang
+    return None
+
+
+def audit_native(native_dir: Path, cfg_native: dict) -> list[str]:
+    problems = []
+    langs = set(cfg_native.get("languages", []))
+    total = 0
+    for p in sorted(native_dir.iterdir()):
+        if p.is_dir():
+            problems.append(f"native/{p.name}: sub-directories are not allowed in native/")
+            continue
+        lang = _lang_of(p)
+        if lang is None:
+            problems.append(f"native/{p.name}: only source files are allowed "
+                            f"({', '.join(e for l in sorted(langs) for e in NATIVE_EXT[l])})")
+            continue
+        if lang not in langs:
+            problems.append(f"native/{p.name}: language '{lang}' is not enabled on this cluster "
+                            f"(enabled: {sorted(langs)}); request it in workspace/environment_requests/")
+            continue
+        src = p.read_text(errors="replace")
+        total += len(src)
+        rx = {"c": _C_BAD, "cpp": _C_BAD, "fortran": _F_BAD, "julia": _J_BAD}[lang]
+        for n, line in enumerate(src.splitlines(), 1):
+            m = rx.search(line)
+            if m:
+                problems.append(f"native/{p.name}:{n}: '{m.group(0).strip()}' is not allowed "
+                                "(no file, process, network or environment access from native code)")
+    if total > int(cfg_native.get("max_source_bytes", 2_000_000)):
+        problems.append("native/: sources exceed the size limit")
+    return problems
 
 FORBIDDEN_CALLS = {
     "open", "eval", "exec", "compile", "__import__", "getattr", "setattr", "delattr",
@@ -82,11 +133,24 @@ def audit_dir(alg_dir, cfg_audit: dict) -> list[str]:
         return ["algorithm.py is missing"]
     local = {p.stem for p in files}
     problems: list[str] = []
+    allowed = set(cfg_audit["allowed_imports"])
+    forbidden = list(cfg_audit["forbidden_submodules"])
+    nat_cfg = cfg_audit.get("native") or {}
+    native = alg_dir / "native"
+    if native.is_dir():
+        if not nat_cfg.get("languages"):
+            problems.append("native/: native code is not enabled in config/harness.yaml (audit.native.languages)")
+        else:
+            problems += audit_native(native, nat_cfg)
+            allowed |= set(nat_cfg.get("extra_imports", []))      # ctypes / juliacall, to call the native code
+            forbidden = [f for f in forbidden if f != "numpy.ctypeslib"]
     for p in files:
-        problems += audit_source(p.read_text(), p.name, set(cfg_audit["allowed_imports"]),
-                                 list(cfg_audit["forbidden_submodules"]), local)
+        problems += audit_source(p.read_text(), p.name, allowed, forbidden, local)
+    for p in alg_dir.iterdir():
+        if p.is_dir() and p.name not in ("native", "__pycache__"):
+            problems.append(f"sub-directory '{p.name}/' is not allowed (only native/ for compiled-language sources)")
     extra = [p.name for p in alg_dir.iterdir()
-             if p.suffix in (".so", ".pyc", ".pyd", ".sh", ".pkl", ".pt", ".npy", ".npz")]
+             if p.suffix in (".so", ".pyc", ".pyd", ".sh", ".pkl", ".pt", ".npy", ".npz", ".o", ".a", ".dylib")]
     if extra:
         problems.append(f"binary / executable files are not allowed in an algorithm dir: {extra}")
     return problems

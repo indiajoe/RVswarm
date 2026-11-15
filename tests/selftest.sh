@@ -17,5 +17,7 @@ check canary_constant      False baselines/canary_constant
 check canary_time_smoother False baselines/canary_time_smoother
 check canary_drop_half     False baselines/canary_drop_half
 check forbidden_code       audit tests/algs/bad_audit
+check native_c_code        True  tests/algs/native_c
+check forbidden_native     audit tests/algs/bad_native
 rm -rf "$OUT"
 [ $fail = 0 ] && echo "ALL SELF-TESTS PASSED" || { echo "SELF-TEST FAILURES"; exit 1; }
