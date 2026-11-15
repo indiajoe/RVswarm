@@ -92,7 +92,7 @@ Methods:
 
 | call | returns |
 |---|---|
-| `ds.scalar(name)` | `[n_obs]` header scalar. Includes CCF shape (`FWHMMOD`, `BISMOD`, `FITMODV0/2/3`, ...), observing geometry (`AIRMASS`, `SUNAGL`, `TCSZA`, ...), `EXPTIME`, `EXTSNR`, drift (`DRIFTRV0`), telluric model (`WVAPOR`, `ZENITH`), environment and thermal telemetry (`ENV*`, `LS218_*`, `CCDTEMP`, `TMC*`). |
+| `ds.scalar(name)` | `[n_obs]` header scalar. Includes CCF shape (`FWHMMOD`, `BISMOD`, `FITMODV0/2/3`, ...), observing geometry (`SUNAGL`, `ZENITH` = solar zenith angle; `AIRMASS` and `TCS*` describe the idle telescope, not the Sun), `NCOMBINE`, `EXPTIME`, `EXTSNR`, drift (`DRIFTRV0`), telluric model (`WVAPOR`, `ZENITH`), environment and thermal telemetry (`ENV*`, `LS218_*`, `CCDTEMP`, `TMC*`). |
 | `ds.activity(name)` | `(value, uncertainty)`, each `[n_obs]`: DRP activity indices (`CaIIHK`, `Ha06_1`, `NaI`, `CaIRT1..3`, `HeI_1`, `Mn539`, `PaDelta`, ... and `_tellcorr` variants) |
 | `ds.ccf(sel=None)` | `(velocity, ccf)`: `velocity [k, 804]` km/s and `ccf [k, 122, 804]` float32 per-order CCFs (G2 ESPRESSO mask, 0.25 km/s steps, about -100 ... +100 km/s). Orders without mask lines are all zeros. `sel` = index array / boolean mask / None (all; can be very large -- prefer batches). |
 | `ds.ccf_batches(batch_size=256)` | iterator of `(obs_indices, velocity, ccf)` over the whole set |

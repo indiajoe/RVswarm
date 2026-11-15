@@ -200,7 +200,7 @@ The averaged files must look like NEID L2 files to the ingest: named `neidL2_*.f
 with a timestamp, the same extensions (`SCIFLUX`, `SCIVAR`, `SCIWAVE`, `SCIBLAZE`,
 `TELLURIC`, `CCFS`, `ACTIVITY`) and header keywords (`CCFRVMOD`, `DVRMSMOD`,
 `CCFJDMOD`, per-order `CCFRVnnn`/`CCFWTnnn`, `SSBZnnn`, ...). Files are dropped if
-`DQLEVEL2` is non-zero, `EXTSNR` < 100 or `AIRMASS` > 2.25 (`data.quality`); check the
+`DQLEVEL2` is non-zero, `EXTSNR` < 100 or the Sun's airmass (from the `ZENITH` keyword) > 3.0 (`data.quality`); check the
 "obs kept" counts in the ingest log.
 
 **Enlarging or replacing the set.** Stage the new files in a new directory, set a new
