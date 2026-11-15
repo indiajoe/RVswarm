@@ -197,8 +197,18 @@ numerical rules.
 
 ## 7. Local self-test available to implementers
 
-The `run_tests` tool runs the audit and then the algorithm on a **toy synthetic Sun**
-with the same array shapes as the real data (about 300 observations, one per day, over
-about 900 days).
-The toy is not physically faithful: use it to prove the code runs, returns the right
-shapes, is deterministic and preserves injected planets -- never to tune physics.
+The `run_tests` tool runs the audit and then the algorithm on a tiny local data set,
+because the orchestrator host has little compute. Normally this is **about five real
+NEID spectra picked by the human scientists** (the report is then titled "Smoke test").
+It proves that the code runs on real data and returns the right shapes, nothing more:
+five spectra cannot measure scatter or planet preservation, which are measured only on
+the cluster. Consequences for implementers:
+
+* The code must run without crashing when `n_obs` is about 5: clip ranks and numbers of
+  components to the data, and fall back to the pipeline RV where a model cannot be fitted.
+* Never tune anything to those few spectra.
+* The report lists, per spectrum, the injected shift and the change in your output; for a
+  planet-preserving method these agree.
+
+If no real frames are configured, a toy synthetic Sun with the same array shapes is used
+instead (about 300 observations over about 900 days). It is not physically faithful.

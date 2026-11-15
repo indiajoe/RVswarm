@@ -102,6 +102,7 @@ are 1e-4 to 4e-4.
 
 ## The toy data used by `run_tests`
 
-Same array shapes and names as above, but a synthetic Sun (random line list,
-Gaussian CCFs, simple correlated activity). It is for checking that code runs. It
-says nothing about what works on the real Sun.
+Normally about five real NEID spectra of the same kind as the evaluation data, picked by
+the human scientists. If none are configured: a synthetic Sun with the same array shapes
+and names (random line list, Gaussian CCFs, simple correlated activity). Either way it
+is for checking that code runs. It says nothing about what works on the full data set.

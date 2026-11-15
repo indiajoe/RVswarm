@@ -155,8 +155,7 @@ The defaults are reasonable; the ones worth a conscious decision:
 * `partitions.sealed_fraction` (0.30): the last 30 % of observing days are sealed.
 * `injection.bands_days`, `k_range_ms`: one hidden planet per band, 8-25 cm/s.
 * `gates.transfer_range` ([0.8, 1.2]) and `target_rms_ms` (0.20).
-* `data.quality`: observations failing these cuts are dropped at ingest. Your data are
-  already vetted, so these are a safety net; loosen them if they remove good data.
+* `data.toy_l2_dir`: the few real frames for the implementers' self-test (section 4.0).
 * `resources`: per-evaluation caps on CPUs, memory, GPU, hours.
 
 ## 4. Build the data store
@@ -199,9 +198,26 @@ follow from this in `config/harness.yaml`:
 The averaged files must look like NEID L2 files to the ingest: named `neidL2_*.fits`
 with a timestamp, the same extensions (`SCIFLUX`, `SCIVAR`, `SCIWAVE`, `SCIBLAZE`,
 `TELLURIC`, `CCFS`, `ACTIVITY`) and header keywords (`CCFRVMOD`, `DVRMSMOD`,
-`CCFJDMOD`, per-order `CCFRVnnn`/`CCFWTnnn`, `SSBZnnn`, ...). Files are dropped if
-`DQLEVEL2` is non-zero, `EXTSNR` < 100 or the Sun's airmass (from the `ZENITH` keyword) > 3.0 (`data.quality`); check the
-"obs kept" counts in the ingest log.
+`CCFJDMOD`, per-order `CCFRVnnn`/`CCFWTnnn`, `SSBZnnn`, ...).
+
+**The harness makes no selection of its own.** There are no S/N, airmass or data-quality
+cuts: every staged file is used exactly as curated. A file that cannot be read, or has no
+finite `CCFRVMOD`/`CCFJDMOD`/`DVRMSMOD`, stops the ingest with an error naming the file.
+
+**Test frames on the orchestrator host.** The implementers' `run_tests` runs on the
+orchestrator host, which has little compute. Put about 5 hand-picked L2 frames in a
+directory there, set `data.toy_l2_dir` in `config/harness.yaml` (or
+`RVSWARM_TOY_DATA_DIR` in `config/cluster.env`) and build their store once:
+
+```bash
+.venv/bin/python -m harness.ingest toy
+```
+
+`run_tests` then runs each new algorithm on those frames, once as they are and once with
+small injected shifts, and reports only whether the code ran and what it returned. Five
+frames cannot measure scatter or planet preservation; an algorithm that absorbs planets
+is caught only by the `screen` stage on the cluster. If `data.toy_l2_dir` is empty, a
+synthetic Sun is used instead (heavier, but it does test planet preservation).
 
 **Enlarging or replacing the set.** Stage the new files in a new directory, set a new
 `data.store_dir`, bump `injection.epoch`, re-run the ingest, then re-queue baselines,
