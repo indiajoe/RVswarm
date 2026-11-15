@@ -21,11 +21,16 @@ data:
   # The curated data set is staged by the humans, so the harness draws nothing itself.
   draw: {mode: none, label: 1, n_spectra: 500, n_days: 100, per_day: 30}
   min_obs_per_day: 1         # curated set: about one 5-min p-mode-averaged spectrum per epoch
-  # Observations are dropped at ingest if any of these fail
-  quality:
-    require_dqlevel2_zero: true
-    min_extsnr: 100
-    max_airmass: 3.0         # of the Sun, from its zenith angle (not the telescope AIRMASS keyword)
+  # The harness makes NO quality selection (no S/N, airmass or data-quality cuts): every
+  # staged file is used, and a file that cannot be read stops the ingest with an error.
+  # Curate the directory by hand.
+  #
+  # A handful (about 5) of hand-picked L2 frames on the ORCHESTRATOR host, used only by the
+  # implementers' `run_tests` smoke test (does the code run on real data?). Build its store
+  # with `python -m harness.ingest toy`. Empty -> a small synthetic Sun is used instead.
+  # Override: $RVSWARM_TOY_DATA_DIR
+  toy_l2_dir: ""
+  toy_store_dir: data_store/toy
 
 partitions:
   # The last `sealed_fraction` of observing days (in time) is SEALED: it is only

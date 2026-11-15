@@ -4,6 +4,7 @@
     python -m harness.ingest shard    --chunk 17         # one array task
     python -m harness.ingest finalize                    # merge scalars, write manifest
     python -m harness.ingest sample                      # tiny store from the sample files (local)
+    python -m harness.ingest toy                         # store of the few frames used by run_tests
 
 The store holds one compressed .npz per observing day (scalars, per-order RVs,
 CCFs, activity indices) plus a manifest that maps observations to raw files so
@@ -12,6 +13,7 @@ full spectra can be read lazily.
 from __future__ import annotations
 
 import argparse
+import shutil
 import json
 import sys
 import traceback
@@ -88,25 +90,9 @@ def plan(store: Path, l2_dir, n_chunks: int, draw: dict | None = None) -> None:
           f"(draw: {json.dumps(draw or {'mode': 'none'})}) -> {n_chunks} chunks in {store / 'plan'}")
 
 
-def _passes(rec: dict, q: dict) -> bool:
-    s = rec["scalars"]
-    if rec["sci_obj"].lower() != "sun" and rec["object"].lower() != "sun":
-        return False
-    if not (np.isfinite(rec["rv"]) and np.isfinite(rec["jd"]) and np.isfinite(rec["rv_err"])):
-        return False
-    if q.get("require_dqlevel2_zero") and s.get("DQLEVEL2", 0) not in (0, 0.0):
-        return False
-    if s.get("EXTSNR", 0) < q.get("min_extsnr", 0):
-        return False
-    # The AIRMASS keyword is the pointing of the idle night-time telescope, not of the
-    # solar feed, so the cut uses the Sun's zenith angle (TELLURIC header).
-    z = s.get("ZENITH", np.nan)
-    if np.isfinite(z) and z < 89 and 1.0 / np.cos(np.radians(z)) > q.get("max_airmass", 99):
-        return False
-    return True
-
-
-def ingest_day(store: Path, day: int, files: list[str], l2_dir, quality: dict) -> int:
+def ingest_day(store: Path, day: int, files: list[str], l2_dir) -> int:
+    """Every staged file goes in. The data set is curated by the humans: the harness makes
+    no quality selection, and a file it cannot use is an error, never a silent drop."""
     out = store / "days" / f"{day}.npz"
     if out.exists():
         return -1
@@ -114,14 +100,14 @@ def ingest_day(store: Path, day: int, files: list[str], l2_dir, quality: dict) -
     for f in files:
         try:
             r = l2io.read_lite(f)
-        except Exception:                                   # corrupt file: skip, but say so
-            print(f"SKIP unreadable {f}\n{traceback.format_exc(limit=1)}", file=sys.stderr)
-            continue
-        if _passes(r, quality):
-            r["relpath"] = str(Path(f).resolve().relative_to(Path(l2_dir).resolve()))
-            recs.append(r)
-    if not recs:
-        return 0
+        except Exception as e:
+            raise SystemExit(f"INGEST STOPPED: cannot read {f}: {e!r}\n"
+                             "Fix or remove this file from the curated set and run the ingest again.")
+        if not (np.isfinite(r["rv"]) and np.isfinite(r["jd"]) and np.isfinite(r["rv_err"])):
+            raise SystemExit(f"INGEST STOPPED: {f} has no finite CCFRVMOD / CCFJDMOD / DVRMSMOD.\n"
+                             "Fix or remove this file from the curated set and run the ingest again.")
+        r["relpath"] = str(Path(f).resolve().relative_to(Path(l2_dir).resolve()))
+        recs.append(r)
     recs.sort(key=lambda r: r["jd"])
     scal_names = sorted(set().union(*(r["scalars"] for r in recs)))
     act_names = recs[0]["act_names"]
@@ -153,11 +139,11 @@ def ingest_day(store: Path, day: int, files: list[str], l2_dir, quality: dict) -
     return len(recs)
 
 
-def shard(store: Path, chunk: int, l2_dir, quality: dict) -> None:
+def shard(store: Path, chunk: int, l2_dir) -> None:
     todo = json.loads((store / "plan" / f"chunk_{chunk:05d}.json").read_text())
     for day, files in todo.items():
-        n = ingest_day(store, int(day), files, l2_dir, quality)
-        print(f"day {day}: {'already done' if n < 0 else f'{n} obs kept of {len(files)}'}", flush=True)
+        n = ingest_day(store, int(day), files, l2_dir)
+        print(f"day {day}: {'already done' if n < 0 else f'{n} spectra'}", flush=True)
 
 
 def finalize(store: Path) -> None:
@@ -207,7 +193,7 @@ def finalize(store: Path) -> None:
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["plan", "shard", "finalize", "sample"])
+    ap.add_argument("cmd", choices=["plan", "shard", "finalize", "sample", "toy"])
     ap.add_argument("--n-chunks", type=int, default=200)
     ap.add_argument("--chunk", type=int)
     ap.add_argument("--l2-dir")
@@ -215,10 +201,16 @@ def main(argv=None) -> None:
     a = ap.parse_args(argv)
     cfg = config.load()
     l2_dir = a.l2_dir or cfg["data"]["l2_dir"]
-    if a.cmd == "sample":
-        store = Path(a.store or cfg["data"]["sample_store_dir"])
+    if a.cmd in ("sample", "toy"):
+        if a.cmd == "toy":                     # the few hand-picked frames for the implementers' test
+            l2_dir = a.l2_dir or cfg["data"].get("toy_l2_dir")
+            if not l2_dir:
+                raise SystemExit("set data.toy_l2_dir in config/harness.yaml (or RVSWARM_TOY_DATA_DIR)")
+        store = Path(a.store or cfg["data"]["toy_store_dir" if a.cmd == "toy" else "sample_store_dir"])
+        if a.cmd == "toy":
+            shutil.rmtree(store, ignore_errors=True)       # always rebuilt from scratch: it is tiny
         plan(store, l2_dir, 1)
-        shard(store, 0, l2_dir, cfg["data"]["quality"])
+        shard(store, 0, l2_dir)
         finalize(store)
         (store / "l2_dir").write_text(str(Path(l2_dir).resolve()))
         return
@@ -226,7 +218,7 @@ def main(argv=None) -> None:
     if a.cmd == "plan":
         plan(store, l2_dir, a.n_chunks, cfg["data"].get("draw"))
     elif a.cmd == "shard":
-        shard(store, a.chunk, l2_dir, cfg["data"]["quality"])
+        shard(store, a.chunk, l2_dir)
     else:
         finalize(store)
 
