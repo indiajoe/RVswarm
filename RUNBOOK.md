@@ -30,7 +30,7 @@ Contents
  │ python -m swarm.cycle loop                           │      │ bin/submit_eval.sh  (bash)  │
  │                                                      │      │   1. fixed promotion rules  │
  │ librarian ─► literature/*.md                         │      │   2. one sbatch per ticket  │
- │ 12 proposers (independent) ─► proposals/…/PROPOSAL.md│      │            │                │
+ │ 24 proposers (independent) ─► proposals/…/PROPOSAL.md│      │            │                │
  │ registrar ─► family tags, registry                   │      │            ▼                │
  │ 3 skeptics ◄─► proposers, N rounds ─► CRITIQUE_*.md  │      │ harness.evaluate            │
  │ proposers ─► SPEC.md (final)                         │      │   audit code                │
@@ -68,6 +68,10 @@ a result directory (`workspace/results/<id>/<stage>_NN/`).
 | `harness/` | ingest, data API, injection, audit, runner, scoring, promotion | fixed code |
 | `bin/submit_eval.sh` | the dumb bash script that submits evaluation jobs | fixed code |
 | `bin/submit_ingest.sh` | builds the compact data store with a SLURM array | fixed code |
+| `bin/swarm.sh`, `bin/py.sh` | run the orchestrator / any project Python command with this swarm's environment loaded | fixed code |
+| `bin/new_swarm.sh` | creates one independent swarm (section 3.5) | fixed code |
+| `config/local.env` | this swarm's name and data directories (not in git) | `bin/new_swarm.sh`, you |
+| `config/trial.yaml` | overlay for the short capped trial run (section 6.0) | you |
 | `baselines/` | 3 reference algorithms + 3 canary cheaters | fixed code |
 | `swarm/` | orchestrator: `cycle.py`, `llm.py`, `prompts.py`, `registry.py`, `tools.py` | fixed code |
 | `workspace/docs/` | problem brief, data description, algorithm interface (what agents are told) | you |
@@ -148,6 +152,10 @@ Requests to Fable 5.2, Opus and Sonnet models are sent with server-side refusal
 fallbacks (`fallbacks: "default"`), so that a declined request is retried on another
 model instead of stalling a cycle. Set `api.refusal_fallbacks: false` to turn that off.
 
+`bin/swarm.sh <command>` runs the orchestrator (`python -m swarm.cycle <command>`) with
+`config/cluster.env` and the swarm's own `config/local.env` loaded. Use it rather than
+calling Python directly, so that the swarm's data paths are always the ones in effect.
+
 ### 3.4 Review `config/harness.yaml`
 
 The defaults are reasonable; the ones worth a conscious decision:
@@ -158,6 +166,69 @@ The defaults are reasonable; the ones worth a conscious decision:
 * `data.toy_l2_dir`: the few real frames for the implementers' self-test (section 4.0).
 * `resources`: per-evaluation caps on CPUs, memory, GPU, hours.
 
+### 3.5 Three independent swarms
+
+The project runs **three swarms that never see each other**. Each is a separate copy of
+this repository with its own `workspace/`, `state/`, harness secret (so its own hidden
+planets), data store and **its own curated set of about 500 spectra**. Nothing is shared
+except the code they started from, the API account and the cluster allocation. If two
+swarms arrive at the same kind of method on different data, that is far stronger
+evidence than one swarm's leaderboard.
+
+Finish sections 3.1 to 3.4 in this repository first and commit (`git clone` copies
+committed files only). Then create the three swarms from it:
+
+```bash
+#                NAME  curated spectra of this swarm (cluster path)   ~5 test frames (orchestrator host)
+bin/new_swarm.sh A     /storage/.../curated_set_A                     /path/to/toy_frames_A
+bin/new_swarm.sh B     /storage/.../curated_set_B                     /path/to/toy_frames_B
+bin/new_swarm.sh C     /storage/.../curated_set_C                     /path/to/toy_frames_C
+```
+
+This makes `../rvswarm_A`, `../rvswarm_B`, `../rvswarm_C`. Each has a `config/local.env`
+(not tracked by git) holding its name and data directories; `config/cluster.env` reads
+it first. SLURM jobs are named `rv_A_screen_<algorithm>` and so on.
+
+Then, **inside each swarm directory**, do sections 4 to 6 exactly as written:
+
+```bash
+cd ../rvswarm_A
+bin/submit_ingest.sh --local          # build this swarm's data store (section 4)
+bin/swarm.sh init                     # queue baselines and canaries
+bin/submit_eval.sh                    # evaluate them; check section 5
+bin/py.sh -m harness.ingest toy        # store of this swarm's test frames
+tmux new -s swarmA
+bin/swarm.sh loop 2>&1 | tee -a state/swarm.log
+```
+
+Rules that keep the swarms independent:
+
+* **Never copy files between the `workspace/` directories**, and do not paste one
+  swarm's results into another's `human_suggestions/`. Steering advice you give to one
+  swarm should not be derived from what another swarm found.
+* **Use different spectra** in the three curated sets and in the three sets of test
+  frames. Overlapping epochs weaken the independence of the evidence.
+* **Code fixes go to all three.** Fix this repository, commit, then in each swarm
+  `git pull` between cycles. `workspace/`, `state/`, `secrets/` and `config/local.env`
+  are untouched by a pull.
+* **Budget is per swarm.** `budget:` in `config/swarm.yaml` is a third of the total
+  (section 11). Each swarm keeps its own ledger.
+* **The test frames may be shared** if curating three sets is a burden: they are only
+  used to check that code runs. The evaluation sets should not be shared.
+
+To compare the swarms (for you, not for the agents):
+
+```bash
+for s in A B C; do echo "== swarm $s"; (cd ../rvswarm_$s && bin/swarm.sh status | head -30); done
+```
+
+The cross-swarm comparison is the final scientific product: which method families
+reach the target in more than one swarm, and whether an algorithm from swarm A also
+works on the data of swarm B. The second test is yours to run by hand at the end, by
+copying the algorithm directory into another swarm and queueing it with
+`bin/py.sh -m harness.promote enqueue --alg <id>`; do it only after that swarm has
+finished, since it breaks the separation.
+
 ## 4. Build the data store
 
 Algorithms never open FITS files. `harness.ingest` converts each L2 file into rows of
@@ -166,7 +237,7 @@ spectra are read lazily from the original files when an algorithm asks for them.
 
 ```bash
 # (a) local check with the sample files (16 files -> seconds)
-.venv/bin/python -m harness.ingest sample
+bin/py.sh -m harness.ingest sample
 
 # (b) the full data set, on the cluster
 bin/submit_ingest.sh 200        # 200 array tasks, then a dependent "finalize" job
@@ -210,7 +281,7 @@ directory there, set `data.toy_l2_dir` in `config/harness.yaml` (or
 `RVSWARM_TOY_DATA_DIR` in `config/cluster.env`) and build their store once:
 
 ```bash
-.venv/bin/python -m harness.ingest toy
+bin/py.sh -m harness.ingest toy
 ```
 
 `run_tests` then runs each new algorithm on those frames, once as they are and once with
@@ -221,7 +292,7 @@ synthetic Sun is used instead (heavier, but it does test planet preservation).
 
 **Enlarging or replacing the set.** Stage the new files in a new directory, set a new
 `data.store_dir`, bump `injection.epoch`, re-run the ingest, then re-queue baselines,
-canaries and the algorithms you still care about (`python -m harness.promote enqueue
+canaries and the algorithms you still care about (`bin/py.sh -m harness.promote enqueue
 --alg <id> --stage full`). Scores from different sets are not comparable.
 
 ### 4.1 Optional: letting the harness draw a random subset
@@ -251,7 +322,7 @@ score is then the scatter of single exposures, not of daily means.
    one store), and run `bin/submit_ingest.sh`.
 2. The hidden planets are re-drawn automatically, because the label is part of their seed.
 3. Re-queue the baselines, canaries and every algorithm you still care about
-   (`python -m harness.promote enqueue --alg <id> --stage full`), then `bin/submit_eval.sh`.
+   (`bin/py.sh -m harness.promote enqueue --alg <id> --stage full`), then `bin/submit_eval.sh`.
    Scores from different draws are not comparable; the leaderboard keeps the latest
    result per algorithm and stage, so an algorithm that is not re-run still shows its
    old-draw score.
@@ -265,12 +336,12 @@ Do these in order. Do not start the swarm until all four look right.
 tests/selftest.sh
 
 # 2. Queue the reference algorithms and canaries on the REAL data
-.venv/bin/python -m swarm.cycle init         # copies baselines/ into workspace/, writes tickets
+bin/swarm.sh init         # copies baselines/ into workspace/, writes tickets
 bin/submit_eval.sh                           # on a node with sbatch
 #    ... wait for the jobs; run bin/submit_eval.sh again to promote screen -> full -> sealed
 
 # 3. Inspect
-.venv/bin/python -m harness.promote leaderboard
+bin/py.sh -m harness.promote leaderboard
 less workspace/results/baseline_pipeline/screen_01/report.md
 ```
 
@@ -317,18 +388,18 @@ cd /path/to/rvswarm
 export ANTHROPIC_API_KEY=sk-ant-...
 export RVSWARM_SWARM_OVERLAY=config/trial.yaml
 
-.venv/bin/python -m swarm.cycle status          # must print limits of 270: the overlay is active
-.venv/bin/python -m swarm.cycle init            # once
+bin/swarm.sh status          # must print limits of 270: the overlay is active
+bin/swarm.sh init            # once
 tmux new -s trial
-.venv/bin/python -m swarm.cycle run 2>&1 | tee -a state/trial.log     # ONE cycle, then exits
+bin/swarm.sh run 2>&1 | tee -a state/trial.log     # ONE cycle, then exits
 ```
 
 Use `run`, not `loop`: `loop` would wait for cluster results and start a second cycle.
 While it runs, and afterwards, from another shell (with the same `RVSWARM_SWARM_OVERLAY`):
 
 ```bash
-.venv/bin/python -m swarm.cycle status          # phase reached, dollars spent
-.venv/bin/python -m swarm.cycle costs           # spending per kind of call, with USD per unit
+bin/swarm.sh status          # phase reached, dollars spent
+bin/swarm.sh costs           # spending per kind of call, with USD per unit
 ```
 
 Things to know:
@@ -375,7 +446,7 @@ git clean -fd workspace/ && git checkout -- workspace/     # agent-written files
 ### 6.1 Dry run without spending anything
 
 ```bash
-RVSWARM_MOCK_LLM=1 .venv/bin/python -m swarm.cycle run
+RVSWARM_MOCK_LLM=1 bin/swarm.sh run
 ```
 
 This walks one whole cycle with canned replies (it writes mock files into
@@ -386,9 +457,9 @@ afterwards with `git clean`).
 
 ```bash
 export ANTHROPIC_API_KEY=...
-.venv/bin/python -m swarm.cycle init            # once (safe to repeat)
+bin/swarm.sh init            # once (safe to repeat)
 tmux new -s swarm
-.venv/bin/python -m swarm.cycle loop 2>&1 | tee -a state/swarm.log
+bin/swarm.sh loop 2>&1 | tee -a state/swarm.log
 ```
 
 `loop` runs cycle after cycle. Between cycles it polls every `cycle.poll_minutes` (15)
@@ -415,9 +486,9 @@ and in-flight batches are picked up again rather than resubmitted.
 To run a single cycle or a single phase by hand:
 
 ```bash
-.venv/bin/python -m swarm.cycle run
-.venv/bin/python -m swarm.cycle run --only propose
-.venv/bin/python -m swarm.cycle status
+bin/swarm.sh run
+bin/swarm.sh run --only propose
+bin/swarm.sh status
 ```
 
 ### 6.3 Evaluation jobs
@@ -445,6 +516,11 @@ Each run of `submit_eval.sh` first applies the promotion rules to finished resul
 
 ### 6.4 The first cycle is different
 
+In a full cycle 24 proposers each write one proposal, three skeptics review each for up
+to 5 rounds, two moderators rank them and 12 are implemented (at least 3 of them novel
+ideas in untried families). Each implementation gets up to 70 tool turns, then up to 4
+rounds of independent review and repair.
+
 Cycle 1 additionally (a) builds the literature library and (b) writes and implements
 six reference reproductions of published methods (`ref_01` ... `ref_06`: SCALPELS,
 FIESTA, line-by-line, FF'/GP, CCF neural network, Doppler-constrained PCA) alongside
@@ -459,11 +535,11 @@ normal cycle.
 | `literature` | librarian (reasoning; web search restricted to publisher / arXiv / ADS domains) | method cards; cycle 1 and every 6th cycle |
 | `postmortem` | the proposer of each newly evaluated algorithm (reasoning) | prediction versus outcome, what limits it, next step |
 | `seminar` | panel of 4 specialists, two rounds, plus minute-taker | why-questions chosen by the moderators last cycle |
-| `propose` | 12 proposers, each alone (reasoning) | one proposal each, with pre-registered predictions |
+| `propose` | 24 proposers, each alone (reasoning) | one proposal each, with pre-registered predictions |
 | `classify` | registrar (routine) | family id, novelty score; new families when warranted |
 | `debate` | 3 skeptics review, the proposer revises; repeated `cycle.debate_rounds` (5) times (reasoning) | per-round critiques and drafts, final `SPEC.md`, `DEBATE_SUMMARY.md` |
-| `moderate` | 2 moderators rank; a fixed rule applies quotas | `SELECTION.md`: 10 ideas, redirects, seminar topics |
-| `implement` | implementer with file tools and toy self-test, then an independent reviewer, up to 2 fix rounds (implementer tier) | code + notes + review; ticket for the cluster |
+| `moderate` | 2 moderators rank; a fixed rule applies quotas | `SELECTION.md`: 12 ideas, redirects, seminar topics |
+| `implement` | implementer with file tools and toy self-test, then an independent reviewer, up to 4 fix rounds (implementer tier) | code + notes + review; ticket for the cluster |
 | `crosspollinate` | synthesist (reasoning); every 3rd cycle after the independent phase | briefs addressed to specific proposers |
 | `digest` | reporter (clerical) | one-page summary for you |
 | `submit` | none | runs `submit_command` if configured |
@@ -520,8 +596,8 @@ Read, in this order:
 Commands:
 
 ```bash
-.venv/bin/python -m swarm.cycle status            # cycle, spending, tickets, leaderboard
-.venv/bin/python -m harness.promote leaderboard   # every result at every stage
+bin/swarm.sh status            # cycle, spending, tickets, leaderboard
+bin/py.sh -m harness.promote leaderboard   # every result at every stage
 cat state/success.json                            # has the goal been met on sealed data?
 tail -f state/swarm.log
 ```
@@ -578,9 +654,9 @@ audit. Agents cannot read that directory.
   `cycle.min_days_between_cycles`,
   `budget.*`.
 * **Re-draw the hidden planets**: bump `injection.epoch` in `config/harness.yaml`, then
-  re-queue the baselines (`python -m harness.promote enqueue --alg baseline_pipeline`,
+  re-queue the baselines (`bin/py.sh -m harness.promote enqueue --alg baseline_pipeline`,
   ...). Do this if you ever suspect the injections have been learned.
-* **Re-run an algorithm**: `python -m harness.promote enqueue --alg <id> --stage full`.
+* **Re-run an algorithm**: `bin/py.sh -m harness.promote enqueue --alg <id> --stage full`.
 * **Stop**: kill the loop. Nothing is lost.
 
 ## 10. How the evaluation resists reward hacking
@@ -659,23 +735,125 @@ queries its value erodes; and the ten-centimetre criterion is evaluated on the S
 
 ## 11. Cost control
 
+### 11.1 Mechanisms
+
 * Every API response is priced into `state/ledger.jsonl` using the table in
-  `config/swarm.yaml` (`pricing:` -- check it against current list prices). Web searches
-  by the librarian are included. `python -m swarm.cycle costs` prints the spending per
-  kind of call and per unit; section 6.0 describes a capped trial run for measuring it.
-* Three hard limits: `budget.usd_per_cycle`, `usd_per_month`, `usd_total`. When one is
-  reached the orchestrator stops cleanly and can be resumed after you raise it.
+  `config/swarm.yaml` (`pricing:`, checked against the published prices on 2026-11-15).
+  Web searches by the librarian are included. `bin/swarm.sh costs` prints the spending
+  per kind of call and per unit of work.
+* Three hard limits per swarm: `budget.usd_per_cycle`, `usd_per_month`, `usd_total`. At
+  the monthly limit the swarm pauses until the next calendar month; at the others it
+  stops cleanly and can be resumed after you raise the limit. A limit is checked before
+  each call or batch, so work in flight can overshoot by a few dollars.
+* The ledger is a local estimate. The Console usage page is authoritative.
 * Single-shot phases (propose, critique, revise, moderate, post-mortem, classify,
   seminar) go through the Message Batches API at half price when
   `api.use_batches: true`. Batches usually finish within an hour but may take up to a
   day; set it to `false` for faster, full-price cycles.
-* The shared project documents are sent as a cached system prompt.
-* Implementation is the expensive phase (tool loops with growing context). To spend
-  less: lower `select_per_cycle`, lower `implement_max_turns`, or move `implement` to a
-  cheaper model tier -- at the risk of good ideas failing through bad code.
-* Rough order of magnitude with the defaults, unmeasured: tens of dollars for the
-  thinking phases and one to a few hundred for ten implementations per cycle. Watch
-  the first two cycles in `swarm.cycle status` and set the limits from what you see.
+* The shared project documents are sent as a cached system prompt. Tool-using agents
+  (implementers, librarian) use the 1-hour cache (`api.agent_cache_ttl`).
+* Implementation is the expensive phase. To spend less: lower `select_per_cycle`,
+  `implement_max_turns` or `implement_fix_rounds`.
+
+### 11.2 What the trial run measured (2026-11-15)
+
+One reduced cycle (4 proposers, 2 debate rounds, 4 implementations, 2 literature
+topics; `config/trial.yaml`) cost an estimated 147.68 USD and took 6 h 32 min.
+
+| kind of call | units | output tokens | cost (USD) | per unit, as run | per unit, waste removed |
+|---|---|---|---|---|---|
+| literature build | 2 topics, 150 searches | 129k | 14.82 | 7.4 per topic | 7.4 |
+| proposal | 4 | 410k | 16.62 | 4.15 | 0.92 |
+| reference reproduction spec | 1 | 26k | 1.64 | 1.64 | 1.64 |
+| critique | 30 | 102k | 3.46 | 0.12 | 0.12 |
+| revision | 7 | 423k | 14.53 | 2.90 (round 1), 0.50 (round 2) | 0.65 |
+| moderator | 2 | 13k | 0.69 | 0.35 | 0.35 (grows with the number of proposals) |
+| implementation | 4 (148 turns) | 586k | 86.18 | 21.5 | 8 |
+| code review | 4 | 142k | 9.67 | 2.4 | 1.4 |
+| classification, digest | 6 | 3k | 0.06 | 0.01 | 0.01 |
+
+About half of the spending was waste, from two causes that are now fixed:
+
+* **Truncated replies (about 20 USD).** Proposals, revisions and reviews hit their output
+  limits and were repeated. The limits were raised.
+* **Cache expiry during self-tests (about 54 USD).** No test frames were configured, so
+  the implementers' self-test used the synthetic Sun and ran for up to 13 minutes; the
+  5-minute cache expired 38 times and the whole transcript was written again each time.
+  Tool-using agents now use the 1-hour cache, and with the real test frames (section 4.0)
+  a self-test takes seconds. **Configure the test frames: this is the largest saving.**
+
+In the debate no proposal settled in round 1 and 3 of 5 settled in round 2.
+
+### 11.3 Cost of one cycle at full scale
+
+Per swarm, with 24 proposers, 5 debate rounds and 12 implementations:
+
+    cost of a cycle  =  3 USD x proposals  +  18 USD x implementations  +  overheads
+
+* **3 USD per proposal** = the proposal (0.92) plus its share of critiques and revisions
+  through the debate, at the settling rate seen in the trial. Measured.
+* **18 USD per implementation**, including its reviews and repairs. **This is an estimate,
+  not a measurement.** The trial measured 8 USD of useful spending with 45 turns and no
+  repair rounds used; the full configuration allows 70 turns and 4 repair rounds, and the
+  1-hour cache costs 1.6 times more per write. A plausible range is 12 to 25 USD.
+* **Overheads**: moderators (about 2 USD), post-mortems (one per finished evaluation, not
+  measured; assume 1 USD each), seminars and digest (a few USD), and a literature refresh
+  every sixth cycle (about 60 USD, so 10 USD per cycle on average).
+
+| | proposals | implementations | expected cost (USD) |
+|---|---|---|---|
+| a normal cycle | 24 | 12 | about 320 (range 250 to 450) |
+| cycle 1 (adds the literature build and 6 reproductions) | 30 | 18 | about 500 (range 400 to 650) |
+
+Later cycles carry more history in each prompt, so expect the cost per cycle to drift
+upwards over the run. The upper ends of the ranges allow for that.
+
+### 11.4 Budget for six months
+
+The budget is 200 000 USD for three swarms over six months.
+
+The number of cycles is set by time, not by money. The orchestrator part of a full
+cycle should take roughly 8 to 12 hours (literature about 1.5 h in the cycles that have
+it, ten debate batches 2 to 4 h, implementation 3 to 5 h). Then the cluster runs the
+screen, full and sealed evaluations. **That turnaround has not been measured.** At one
+cycle every one to two days a swarm completes 90 to 180 cycles in six months.
+
+| per swarm | cycles in 6 months | cost per cycle (USD) | six months (USD) |
+|---|---|---|---|
+| slow, cheap | 90 | 250 | 23 000 |
+| expected | 120 | 320 | 39 000 |
+| fast, expensive | 180 | 450 | 81 000 (stops at the 66 000 limit) |
+
+| three swarms | six months (USD) |
+|---|---|
+| slow, cheap | 69 000 |
+| expected | about 117 000 |
+| upper bound enforced by the limits | 198 000 |
+
+So the expected spending is about 60 % of the budget, and the limits in
+`config/swarm.yaml` (66 000 USD in total and 11 000 USD per month for each swarm)
+guarantee that the three ledgers together cannot pass 198 000 USD. The remaining 2 000
+USD covers overshoot of work in flight and the difference between the ledger and the
+invoice.
+
+What to do with these numbers:
+
+* **After the first five cycles of one swarm**, run `bin/swarm.sh costs` and replace the
+  18 USD and the cycle duration above with what was measured. Those two numbers carry
+  almost all of the uncertainty.
+* **If spending runs ahead** (more than 11 000 USD per swarm per month), the monthly
+  limit pauses the swarm. Lower `select_per_cycle` or `implement_fix_rounds` rather than
+  waiting for the month to end.
+* **If spending runs well below** the budget after two months, the spare money is best
+  used on `implement_fix_rounds`, on `select_per_cycle`, or on enlarging the curated
+  sets (which costs cluster time, not API money) -- not on more proposers.
+* **Cluster load** grows with the same numbers: 12 new algorithms per swarm per cycle,
+  each up to three evaluation stages of 8 to 24 hours at most. Three swarms can queue
+  36 screen jobs per cycle round. Check that your allocation can absorb this before
+  raising anything.
+* **API rate limits**: a full debate round is one batch of 72 to 90 requests per swarm,
+  and each swarm runs 6 implementers in parallel (18 in total). Check the organisation's
+  limits in the Console before starting all three.
 
 ## 12. Troubleshooting
 
@@ -690,11 +868,17 @@ queries its value erodes; and the ten-centimetre criterion is evaluated on the S
 | result `status: run_failed` | traceback is in the report; SLURM log in `state/slurm_logs/` |
 | many `implementation_failed` | read `workspace/algorithms/<id>/REVIEW.md`; specs may be too ambitious for the turn limit -- raise `implement_max_turns` |
 | algorithm needs a package | add to `audit.allowed_imports`, install on the cluster and orchestrator, document in `ALGORITHM_INTERFACE.md` |
-| `Refusing to submit` / result `status: no_sandbox` | set `RVSWARM_SANDBOX_CMD` (section 10) or `RVSWARM_ALLOW_UNSANDBOXED=1`; then re-queue with `python -m harness.promote enqueue --alg <id>` |
+| `Refusing to submit` / result `status: no_sandbox` | set `RVSWARM_SANDBOX_CMD` (section 10) or `RVSWARM_ALLOW_UNSANDBOXED=1`; then re-queue with `bin/py.sh -m harness.promote enqueue --alg <id>` |
 | `sbatch` rejects flags | adjust `RVSWARM_SBATCH_*` in `config/cluster.env` (`RVSWARM_SBATCH_EXTRA` takes any extra flags) |
 | want to start over | delete `workspace/{proposals,selected,algorithms,results,postmortems,registry,seminars,digests,agents,crosspollination}` and `state/`, then `swarm.cycle init` |
 
 ## 13. What has and has not been tested
+
+Tested with the live API (trial run of 2026-11-15, section 11.2): one reduced cycle
+through every phase that occurs in cycle 1 -- literature with web search, proposals,
+classification, two debate rounds, moderation, four implementations with code review,
+digest. Not yet exercised live: post-mortems, seminars, cross-pollination, repair
+rounds after a failed review, and the 1-hour cache setting (added after the trial).
 
 Tested here:
 
@@ -710,10 +894,10 @@ spectra from one hour:
 
 * **The container wrapper** (`RVSWARM_SANDBOX_CMD`). Only the substitution mechanism was
   tested, with a dummy wrapper. Build and test the real one before trusting any score.
-* **Live API calls.** The request shapes follow the current SDK (`anthropic` 2.8) and
-  API documentation, but the first real cycle is the first real test. Run
-  `swarm.cycle run --only literature` and `--only propose` first and read the output
-  before letting the loop go.
+* **The full-scale configuration with the live API** (24 proposers, 5 debate rounds, 12
+  implementations, 70 turns, 4 repair rounds, 1-hour cache). It was run only with canned
+  replies. Watch the first full cycle of the first swarm before starting the other two.
+* **Three swarms at once**: API rate limits and cluster queue load are unknown.
 * **SLURM submission** on your cluster (flags, modules, GPU request syntax).
 * **Scoring on real multi-year data.** Section 5 is that test; the baselines and
   canaries must behave as tabulated there.

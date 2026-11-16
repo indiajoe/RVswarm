@@ -5,6 +5,10 @@ for removing stellar-activity signals from NEID Sun-as-a-star radial velocities,
 the goal of several independent methods below 20 cm/s RMS per epoch that provably leave
 planetary signals intact.
 
+The project runs three fully independent swarms, each on its own curated set of about
+500 spectra (RUNBOOK section 3.5), with a combined API budget of 200 000 USD over six
+months (RUNBOOK section 11).
+
 **Start with [`RUNBOOK.md`](RUNBOOK.md).** It covers setup, validation, running,
 monitoring, steering and the integrity design.
 
@@ -27,8 +31,8 @@ Shortest path to a first run:
 tests/selftest.sh                                 # 1. harness sanity
 $EDITOR config/cluster.env                        # 2. data path, python, SLURM account, sandbox
 bin/submit_ingest.sh                              # 3. build the data store (cluster)
-.venv/bin/python -m swarm.cycle init              # 4. queue baselines + canaries
+bin/swarm.sh init              # 4. queue baselines + canaries
 bin/submit_eval.sh                                # 5. evaluate them; check RUNBOOK section 5
 export ANTHROPIC_API_KEY=...                      # 6. start the swarm
-.venv/bin/python -m swarm.cycle loop
+bin/swarm.sh loop
 ```
