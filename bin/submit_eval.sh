@@ -29,7 +29,7 @@ for T in state/eval_queue/*.json; do
     bash bin/eval_job.sbatch "$ALG" "$STAGE" "state/eval_submitted/$NAME"
     continue
   fi
-  ARGS=(--job-name="rv_${STAGE}_${ALG}" --cpus-per-task="$CPUS" --mem="${MEM}G"
+  ARGS=(--job-name="rv${RVSWARM_NAME:+_$RVSWARM_NAME}_${STAGE}_${ALG}" --cpus-per-task="$CPUS" --mem="${MEM}G"
         --time="$MINUTES" --nodes=1 --ntasks=1
         --output="state/slurm_logs/${ALG}__${STAGE}_%j.log")
   [ -n "${RVSWARM_SBATCH_ACCOUNT}" ] && ARGS+=(--account="${RVSWARM_SBATCH_ACCOUNT}")
