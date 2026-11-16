@@ -256,8 +256,8 @@ roughly 0.3 s per file.
 ### 4.0 The curated data set (current setup)
 
 The harness is configured for a curated set that you stage yourself: about 500
-5-minute p-mode-averaged L2 spectra spread over five years (photon noise near
-11 cm/s), later perhaps 1000-2000. Point `NEID_DATA_DIR` at that directory and run
+20-minute averaged L2 spectra (16 frames each, `NCOMBINE` = 16) spread over five years
+(photon noise near 6 cm/s), later perhaps 1000-2000. Point `NEID_DATA_DIR` at that directory and run
 the ingest; every algorithm is then tested on exactly those files. Settings that
 follow from this in `config/harness.yaml`:
 

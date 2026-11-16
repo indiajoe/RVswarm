@@ -115,7 +115,7 @@ or process pools that receive plain NumPy arrays.
 
 Cost guide: scalars, RVs and indices are in memory. CCFs cost about 0.4 MB per
 observation to load. A full spectrum is about 30 MB and roughly 0.1-0.3 s to read. The
-data set is a few hundred to a couple of thousand observations (5-minute averages,
+data set is a few hundred to a couple of thousand observations (20-minute averages,
 usually one per observing day), so a pass over every spectrum is affordable; still read
 only the orders you need and cache derived features with `ctx.scratch_file`.
 

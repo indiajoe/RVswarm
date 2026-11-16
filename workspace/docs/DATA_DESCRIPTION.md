@@ -6,26 +6,30 @@ Facts below were measured on real files; treat them as reliable.
 
 * Sun-as-a-star through the NEID solar feed (integrating sphere, HR fibre), `OBSTYPE=Eng`,
   `OBJECT=Sun`. The instrument takes 55 s exposures at about 93 s cadence. **Each spectrum you
-  are given is the mean of 4 exposures taken within about 5 to 10 minutes** (header
-  scalar `NCOMBINE` = 4), which integrates over the 5-minute p-mode oscillations. The
-  four frames were each shifted to the barycentric frame, interpolated onto the
-  wavelength grid of the first frame and averaged. Measured on sample files: the flux
-  variance is that of the mean, and S/N per pixel near 660 nm is about 1150 (a single
-  exposure: about 550).
+  are given is the mean of 16 consecutive exposures spanning about 20 to 25 minutes**
+  (header scalar `NCOMBINE` = 16; always read it, do not assume it), which integrates
+  over several periods of the 5-minute p-mode oscillations and part of the granulation
+  signal. The frames were each shifted to the barycentric frame, interpolated onto the
+  wavelength grid of the first frame and averaged. The photon-noise RV uncertainty of
+  such a spectrum is about 0.06 m/s, well below the 0.20 m/s goal, so the scatter you
+  have to remove is almost entirely stellar and instrumental. The properties below were
+  checked on earlier sample files that combined 4 frames; for 16 frames expect the S/N
+  per pixel to be about four times that of a single exposure (about 2200 near 660 nm;
+  single exposure: about 550; not yet measured on 16-frame files).
 * **What the header-derived values mean for a combined spectrum** (checked on sample files):
-  - `time`, `ssb_z` and the `OBSJD` scalar are those of the FIRST of the four frames.
-    The effective mid-time is 2 to 5 minutes later. `ssb_z` is the correct one for the
+  - `time`, `ssb_z` and the `OBSJD` scalar are those of the FIRST of the combined frames.
+    The effective mid-time is about 10 to 12 minutes later for 16 frames. `ssb_z` is the correct one for the
     wavelength grid you are given.
   - `rv_pipeline`, `rv_pipeline_sum`, `order_rv`, the CCF arrays, and the other numeric
-    header scalars are the MEAN over the four frames. A Gaussian refit of the averaged
+    header scalars are the MEAN over the combined frames. A Gaussian refit of the averaged
     CCF reproduces `rv_pipeline` to about 1 mm/s.
   - `rv_pipeline_err` is the mean single-frame value divided by sqrt(`NCOMBINE`): about
-    0.12 m/s. The raw scalars `DVRMSMOD`, `EFWHMMOD`, `EBISMOD` and `EXTSNR` are still
+    0.06 m/s for 16 frames. The raw scalars `DVRMSMOD`, `EFWHMMOD`, `EBISMOD` and `EXTSNR` are still
     single-frame means (about 0.245 m/s and S/N 510), not values for the combined spectrum.
   - `EXPTIME` is the single-frame exposure time (55 s), not the total.
   - The `AIRMASS` scalar is the pointing of the idle night-time telescope and says nothing
     about the Sun. Use `ZENITH` (solar zenith angle, degrees) instead.
-  - Whether the activity-index table is the mean of four frames has not been verified.
+  - Whether the activity-index table is the mean of the combined frames has not been verified.
 * **The flux is already telluric-corrected** (divided by the DRP telluric model), and no
   telluric model arrays are provided. In saturated telluric cores (for example the O2 A
   band near 7600-7630 A) the division leaves wild values: mask such regions yourself.

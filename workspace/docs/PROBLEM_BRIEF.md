@@ -11,9 +11,9 @@ apparent RV variations of 0.5 - several m/s.
 
 We have a curated set of cleaned, vetted Sun-as-a-star spectra from the NEID
 spectrograph (WIYN 3.5 m, Kitt Peak; R ~ 110,000; 380-930 nm) spread over about five
-years: roughly 500 spectra, each the mean of 4 consecutive exposures (about 6 minutes)
+years: roughly 500 spectra, each the mean of 16 consecutive exposures (about 20 minutes)
 that already integrates over the solar p-mode oscillations, with a photon-noise RV
-uncertainty near 11-12 cm/s. They are
+uncertainty near 6 cm/s, well below the goal. They are
 sparse in time (typically one spectrum on an observing day, days apart), like a
 realistic survey of another star. The Sun's true centre-of-mass RV in these data is
 constant (the pipeline RVs are heliocentric), so every variation is nuisance signal

@@ -3,7 +3,7 @@ a run is scored: weights are the pipeline photon errors, binning is fixed here.
 
 Headline numbers
   rms_null_daily   RMS (m/s) of the corrected RVs per epoch (weighted mean of the spectra of one
-                   day; with the curated set that is normally a single 5-min-averaged spectrum).
+                   day; with the curated set that is normally a single 20-min-averaged spectrum).
   transfer[band]   recovered / injected amplitude of each hidden planet, measured on
                    (corrected RVs with planets) - (corrected RVs without planets).
   effective_rms    rms_null_daily / min(1, min transfer): a method that halves planets
