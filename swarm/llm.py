@@ -46,9 +46,13 @@ class Ledger:
     def add(self, model: str, usage, role: str, tag: str, cycle: int, batch: bool = False) -> float:
         g = lambda k: int(getattr(usage, k, 0) or 0)
         p = self.pricing.get(model, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0})
+        cc = getattr(usage, "cache_creation", None)          # split of cache writes by lifetime
+        w1h = int(getattr(cc, "ephemeral_1h_input_tokens", 0) or 0) if cc is not None else 0
+        w1h = min(w1h, g("cache_creation_input_tokens"))
         usd = (g("input_tokens") * p["input"] + g("output_tokens") * p["output"]
                + g("cache_read_input_tokens") * p["cache_read"]
-               + g("cache_creation_input_tokens") * p["cache_write"]) / 1e6
+               + (g("cache_creation_input_tokens") - w1h) * p["cache_write"]
+               + w1h * p.get("cache_write_1h", 1.6 * p["cache_write"])) / 1e6
         if batch:
             usd *= 0.5
         stu = getattr(usage, "server_tool_use", None)
@@ -57,7 +61,7 @@ class Ledger:
         row = {"t": time.strftime("%Y-%m-%dT%H:%M:%S"), "cycle": cycle, "role": role, "tag": tag,
                "model": model, "in": g("input_tokens"), "out": g("output_tokens"),
                "cache_read": g("cache_read_input_tokens"),
-               "cache_write": g("cache_creation_input_tokens"), "web_searches": searches, "usd": round(usd, 5), "batch": batch}
+               "cache_write": g("cache_creation_input_tokens"), "cache_write_1h": w1h, "web_searches": searches, "usd": round(usd, 5), "batch": batch}
         with self._lock, open(self.path, "a") as fh:
             fh.write(json.dumps(row) + "\n")
         return usd
@@ -99,13 +103,14 @@ class LLM:
         r = self.cfg["roles"][role]
         return self.cfg["models"][r["model"]], r
 
-    def _params(self, role: str, system: str, user, schema: dict | None, tools=None) -> dict:
+    def _params(self, role: str, system: str, user, schema: dict | None, tools=None,
+                cache: dict | None = None) -> dict:
         model, r = self._role(role)
         oc: dict = {"effort": r["effort"]}
         if schema is not None:
             oc["format"] = {"type": "json_schema", "schema": schema}
         p = {"model": model, "max_tokens": r["max_tokens"], "output_config": oc,
-             "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+             "system": [{"type": "text", "text": system, "cache_control": cache or {"type": "ephemeral"}}],
              "messages": user if isinstance(user, list) else [{"role": "user", "content": user}]}
         if tools:
             p["tools"] = tools
@@ -251,9 +256,16 @@ class LLM:
         tools = list(toolset.definitions()) + list(server_tools or [])
         messages = [{"role": "user", "content": user}]
         final = ""
+        # Tool loops wait on local test runs that can outlast the 5-minute cache, after which
+        # the whole transcript is written again at full price. The 1-hour cache costs 1.6x
+        # per write but survives those waits. (Same lifetime on the system block: a longer
+        # lifetime may not follow a shorter one in a request.)
+        cache = {"type": "ephemeral"}
+        if self.cfg["api"].get("agent_cache_ttl", "1h") == "1h":
+            cache = {"type": "ephemeral", "ttl": "1h"}
         for turn in range(max_turns):
-            params = self._params(role, system, messages, None, tools)
-            params["cache_control"] = {"type": "ephemeral"}       # cache the growing transcript
+            params = self._params(role, system, messages, None, tools, cache)
+            params["cache_control"] = cache                       # cache the growing transcript
             msg = self._live(params, role, f"{tag}#t{turn}")
             messages.append({"role": "assistant", "content": msg.content})
             final = _text(msg) or final

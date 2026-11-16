@@ -21,14 +21,15 @@ api:
 
 cycle:
   debate_rounds: 2           # full run: 5
-  select_per_cycle: 3        # full run: 10
+  select_per_cycle: 3        # full run: 12
   wildcard_slots: 1
   seminar_topics: 1
   max_postmortems_per_cycle: 4
   # implement_max_turns and implement_fix_rounds are left at full scale on purpose:
   # one implementation must cost here what it will cost in the real run.
+  # (The trial of 2026-11-15 ran with 45 turns and 2 fix rounds; the full run now uses 70 and 4.)
 
-# 4 of the 12 proposers, chosen to span personas, knowledge slices and data views
+# 4 of the 24 proposers, chosen to span personas, knowledge slices and data views
 proposer_slots:
   - {id: P01, persona: solar_physicist,        knowledge: full, view: spectra}
   - {id: P07, persona: exoplanet_rv,           knowledge: none, view: ccf_and_indices}
