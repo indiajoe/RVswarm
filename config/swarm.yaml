@@ -8,19 +8,21 @@ models:
   routine: claude-sonnet-5-5       # classification, seminar minutes
   clerical: claude-haiku-5-5       # digests and other reporting
 
-# Which model tier and effort each kind of call uses.
+# Which model tier and effort each kind of call uses. max_tokens includes the model's
+# thinking: a reply cut off at the limit is paid for and then repeated (the trial of
+# 2026-11-15 lost about 20 USD that way with limits of 32000 / 12000).
 roles:
   literature:      {model: reasoning,   effort: high,   max_tokens: 32000}
-  reproduce:       {model: reasoning,   effort: high,   max_tokens: 32000}
-  propose:         {model: reasoning,   effort: high,   max_tokens: 32000}
+  reproduce:       {model: reasoning,   effort: high,   max_tokens: 64000}
+  propose:         {model: reasoning,   effort: high,   max_tokens: 64000}
   critique:        {model: reasoning,   effort: medium, max_tokens: 12000}
-  revise:          {model: reasoning,   effort: high,   max_tokens: 32000}
-  moderate:        {model: reasoning,   effort: high,   max_tokens: 20000}
-  postmortem:      {model: reasoning,   effort: high,   max_tokens: 16000}
+  revise:          {model: reasoning,   effort: high,   max_tokens: 64000}
+  moderate:        {model: reasoning,   effort: high,   max_tokens: 32000}
+  postmortem:      {model: reasoning,   effort: high,   max_tokens: 32000}
   seminar:         {model: reasoning,   effort: medium, max_tokens: 8000}
-  crosspollinate:  {model: reasoning,   effort: high,   max_tokens: 20000}
-  implement:       {model: implementer, effort: high,   max_tokens: 32000}
-  review:          {model: implementer, effort: high,   max_tokens: 12000}
+  crosspollinate:  {model: reasoning,   effort: high,   max_tokens: 32000}
+  implement:       {model: implementer, effort: high,   max_tokens: 64000}
+  review:          {model: implementer, effort: high,   max_tokens: 32000}
   classify:        {model: routine,     effort: low,    max_tokens: 4000}
   minutes:         {model: routine,     effort: medium, max_tokens: 8000}
   digest:          {model: clerical,    effort: medium, max_tokens: 8000}
