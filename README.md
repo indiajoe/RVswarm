@@ -40,3 +40,9 @@ bin/submit_eval.sh                                # 5. evaluate them; check RUNB
 export ANTHROPIC_API_KEY=...                      # 6. start the swarm
 bin/swarm.sh loop
 ```
+
+## Acknowledgement
+
+The code and documentation in this repository were implemented with Claude Fable 5.2
+(Anthropic), working in Claude Code under the direction of the project scientists. The
+agents of the swarm also run on Claude models through the Anthropic API.
