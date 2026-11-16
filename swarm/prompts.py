@@ -108,6 +108,9 @@ with expected sizes of effects.
 Numbered steps precise enough that a careful programmer who cannot ask you questions will build \
 what you mean: inputs (exact `SolarDataset` members), every transformation with formulae, every \
 hyper-parameter with its value and how it was chosen, numerical details that matter, outputs. \
+Whenever you give an order, pixel or velocity-step index as a number, write it as 0-based (the \
+convention of the project documents) and say so, for example "order index 60 (0-based)"; give the \
+echelle order number or the wavelength as well when it helps. \
 Say how it fits the resource request. If the method would be clearer, faster or only practical \
 with a package that is not on the allow-list, say so and list it under `requires` -- do not bend \
 the method to fit the default environment. Python is the preferred language: ask for a core in C, \
@@ -338,6 +341,13 @@ def implement_prompt(alg_id: str, parents: list[str]) -> str:
             "`ctx.scratch_file`, use `ctx.n_cpus` / the GPU if requested, log progress with `ctx.log`, and "
             "degrade gracefully (NaN for an observation, not a crash) on bad data.\n"
             "- Determinism: seed everything from `ctx.seed`.\n"
+            "- Indices. Every index in the project documents and in `SolarDataset` is 0-based. When you write "
+            "an index in a comment, a log line or the notes, say which base it uses. In Fortran or Julia "
+            "code (1-based, column-major arrays) convert explicitly at the boundary and comment the "
+            "conversion.\n"
+            "- CPU time is scarce on the cluster. Read each spectrum once and only the orders you need, "
+            "vectorise, and request in `algorithm.yaml` only the CPUs, memory and hours the code really "
+            "uses. A numerical analyst and a performance engineer will examine the code after you.\n"
             "- The evaluation is fixed and you cannot see the real data. Do not add anything whose purpose is "
             "to do well on the score rather than to implement the method; in particular nothing that fits "
             "free functions of time unless the specification's mechanism calls for it.\n\n"
@@ -377,7 +387,11 @@ def review_prompt(alg_id: str, spec: str, files: str, toy_report: str) -> str:
             "2. Fidelity: each numbered step of the specification is implemented as written; deviations are "
             "listed in the notes and justified; requested diagnostics are emitted.\n"
             "3. Correctness: units (m/s vs km/s), sign conventions, array alignment with `ds.obs_id`, NaN "
-            "handling, numerical stability, behaviour at 10^5 observations, memory and time.\n\n"
+            "handling, behaviour both with about 5 and with a couple of thousand observations. Indices: every "
+            "index in the project documents is 0-based; check each order, pixel and velocity index against "
+            "that, especially where the specification gives numbers and where arrays pass to Fortran or "
+            "Julia (1-based, column-major). A numerical analyst reviews precision and conditioning "
+            "separately and a performance engineer reviews speed, so do not spend effort there.\n\n"
             "Verdict `pass` when remaining issues would not change the scientific result; `fix` with concrete "
             "issues an implementer can act on; `reject` only if the code cannot be repaired without a new "
             "specification. A method you expect to perform poorly is not a reason to fail the review.\n\n"
@@ -385,11 +399,129 @@ def review_prompt(alg_id: str, spec: str, files: str, toy_report: str) -> str:
             f"<toy_run_report>\n{toy_report}\n</toy_run_report>")
 
 
+NUMERICS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["pass", "fix"]},
+        "numerical_issues": {"type": "array", "items": {"type": "string"}},
+        "summary": {"type": "string"},
+    },
+    "required": ["verdict", "numerical_issues", "summary"],
+    "additionalProperties": False,
+}
+
+
+def numerics_prompt(alg_id: str, spec: str, files: str, toy_report: str) -> str:
+    return (f"You are the numerical analyst of the collaboration, acting as a skeptic. Algorithm `{alg_id}` is "
+            "about to use cluster time. You did not write it. Find the places where the NUMERICAL "
+            "IMPLEMENTATION, not the idea, would produce a wrong or unstable answer. The goal is radial "
+            "velocities good to 0.1 m/s, which is 3e-10 of the speed of light: errors that are harmless "
+            "elsewhere matter here.\n\n"
+            "Go through the code for:\n"
+            "1. Indexing and memory layout. Every index in the project documents is 0-based. Look for "
+            "off-by-one errors in order, pixel and velocity indices; for 0-based numbers used unchanged in "
+            "Fortran or Julia code (1-based); for arrays crossing to Fortran or Julia without accounting for "
+            "column-major storage; for dtype, contiguity and integer-width mismatches at a `ctypes` boundary.\n"
+            "2. Precision against the goal. float32 where float64 is needed (a float32 wavelength is good to "
+            "about 30 m/s; float32 CCFs summed over many pixels); catastrophic cancellation; differences of "
+            "large numbers; interpolation whose error is not small compared with 0.1 m/s; inconsistent "
+            "Doppler formulae or constants; accumulated rounding in long sums.\n"
+            "3. Conditioning. Normal equations where QR or SVD is needed; unscaled polynomial or time bases; "
+            "rank-deficient fits (also when `n_obs` is about 5); matrix inverses where a solve is meant; "
+            "covariance matrices without the jitter that keeps a Cholesky factorisation alive; "
+            "regularisation whose strength depends on the units of the inputs.\n"
+            "4. Iterations and randomness. Convergence tests that can pass without convergence or never "
+            "pass; iteration limits reached silently; dependence on starting values; results that change "
+            "with the number of threads; random numbers not seeded from `ctx.seed`.\n"
+            "5. Bad values. NaN or infinity spreading through sums, sorts and fits; zero or negative "
+            "variances used as weights; division by quantities that can be near zero; edges of orders and "
+            "of the velocity grid.\n"
+            "6. If the test report says a performance optimisation changed the output, decide whether the "
+            "change is rounding (far below 1 cm/s) or a real difference.\n\n"
+            "For each issue give the file and function, what goes wrong and how large the effect could be "
+            "(in m/s where you can estimate it), and the concrete fix. Report only issues that could change "
+            "the result or make a run fail; no style remarks. Whether the idea is good, whether the code "
+            "follows the specification and how fast it runs are other reviewers' business. Verdict `pass` "
+            "when nothing you found would change the scientific result, otherwise `fix`.\n\n"
+            f"<specification>\n{spec}\n</specification>\n\n<code_and_notes>\n{files}\n</code_and_notes>\n\n"
+            f"<test_run_report>\n{toy_report}\n</test_run_report>")
+
+
+PERFORMANCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["ok", "optimise"]},
+        "changes": {"type": "array", "items": {"type": "string"}},
+        "recommended_resources": {
+            "type": "object",
+            "properties": {"cpus": {"type": "integer"}, "mem_gb": {"type": "integer"},
+                           "hours": {"type": "number"}, "parallel_runs": {"type": "boolean"}},
+            "required": ["cpus", "mem_gb", "hours", "parallel_runs"],
+            "additionalProperties": False,
+        },
+        "estimated_core_hours_screen": {"type": "number"},
+        "summary": {"type": "string"},
+    },
+    "required": ["verdict", "changes", "recommended_resources", "estimated_core_hours_screen", "summary"],
+    "additionalProperties": False,
+}
+
+
+def performance_prompt(alg_id: str, spec: str, files: str, toy_report: str) -> str:
+    return (f"You are the performance engineer of the collaboration, consulted before algorithm `{alg_id}` "
+            "is run on the cluster. The code has passed review for correctness. The cluster is short of "
+            "CPU time, and every evaluation runs this code two or three times on a few hundred to a couple "
+            "of thousand spectra (122 orders x 9216 pixels, about 30 MB and 0.1-0.3 s to read each), so "
+            "wasted CPU time delays every other algorithm. Find what would cut the CPU time of this code, "
+            "and check that it asks for no more than it can use.\n\n"
+            "Look for:\n"
+            "1. Reading. Spectra read more than once, or whole spectra read where a few orders are used; "
+            "features recomputed in a second pass instead of cached in memory or with `ctx.scratch_file`.\n"
+            "2. Loops. Python loops over pixels, lines or observations that vectorised NumPy, Numba or one "
+            "batched call would replace; work repeated inside a loop that could be done once outside.\n"
+            "3. Algorithms. A cheaper algorithm with the SAME result: a solve instead of an inverse, a "
+            "thin SVD instead of a full one, exploiting banded or low-rank structure, FFT-based "
+            "correlation, fewer but sufficient optimiser or sampler iterations when convergence is checked.\n"
+            "4. Parallelism. Cores requested but unused; a process or thread pool on top of multi-threaded "
+            "BLAS (oversubscription); pools that copy large arrays to each worker.\n"
+            "5. The resource request in `algorithm.yaml`. Estimate the wall time and memory of one run on "
+            "500 and on 2000 spectra from the code and from the timings in the test report. Recommend the "
+            "smallest `cpus`, `mem_gb` and `hours` that are safe (the hours cover the two runs of a screen "
+            "evaluation; leave a factor of about two in time and 1.5 in memory). Single-threaded code "
+            "should ask for 1 or 2 CPUs.\n"
+            "6. Native code. C, C++, Fortran or Julia is justified only where Python cannot be made fast "
+            "enough; conversely, say so if one hot loop deserves it.\n\n"
+            "Rules. A change must leave the numerical results unchanged apart from rounding and must not "
+            "alter the method. Never trade precision for speed (no float32 for wavelengths, velocities or "
+            "sums that feed the RV). Recommend only changes that should save at least about a fifth of the "
+            "run's CPU time, or that correct the resource request; say for each what to change, where "
+            "(file and function), and roughly what it saves. Verdict `ok` when no such change exists -- "
+            "most simple methods need none -- and `optimise` otherwise.\n\n"
+            f"<specification>\n{spec}\n</specification>\n\n<code_and_notes>\n{files}\n</code_and_notes>\n\n"
+            f"<test_run_report>\n{toy_report}\n</test_run_report>")
+
+
+def optimise_prompt(alg_id: str, perf: dict) -> str:
+    r = perf.get("recommended_resources") or {}
+    changes = "\n".join(f"- {c}" for c in perf.get("changes", []))
+    return (f"You are an implementer. The code in `algorithms/{alg_id}/` passed review. Before it uses "
+            "cluster CPU time, the performance engineer recommends these changes:\n\n"
+            f"{changes}\n\nRecommended resource request for `algorithm.yaml`: {r}\n"
+            f"Performance engineer's summary: {perf.get('summary', '')}\n\n"
+            "First call `run_tests` and keep the reported numbers. Then make the changes. They must not "
+            "change the method or its results: after each substantial change call `run_tests` again and "
+            "compare with the numbers you kept; differences must be rounding only (far below 1 cm/s). If a "
+            "recommended change would alter the results or the method, do not make it, and say why in "
+            "`IMPLEMENTATION_NOTES.md` under a heading 'Performance'. List there what you changed. The code "
+            "will be reviewed again after this pass. Reply with a three-line summary.")
+
+
 def fix_prompt(alg_id: str, review: dict) -> str:
-    issues = "\n".join(f"- [{k}] {i}" for k in ("integrity_issues", "fidelity_issues", "correctness_issues")
+    issues = "\n".join(f"- [{k}] {i}" for k in ("integrity_issues", "fidelity_issues", "correctness_issues",
+                                                "numerical_issues")
                        for i in review.get(k, []))
-    return (f"You are an implementer. A reviewer examined `algorithms/{alg_id}/` against its `SPEC.md` and "
-            f"asked for changes:\n\n{issues}\n\nReviewer summary: {review.get('summary', '')}\n\n"
+    return (f"You are an implementer. A code reviewer and a numerical analyst examined `algorithms/{alg_id}/` "
+            f"against its `SPEC.md` and asked for changes:\n\n{issues}\n\nReviewer summary: {review.get('summary', '')}\n\n"
             "Read the current files, fix each issue (or explain in `IMPLEMENTATION_NOTES.md` why the reviewer "
             "is mistaken), keep fidelity to the specification, and confirm with `run_tests` that the algorithm "
             "still completes. Reply with a three-line summary.")

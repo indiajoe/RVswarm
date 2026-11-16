@@ -1,0 +1,3 @@
+name: no gain
+family: F00
+resources: {cpus: 1, mem_gb: 4, hours: 0.2, gpus: 0}

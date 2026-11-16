@@ -20,5 +20,10 @@ check canary_drop_half     False baselines/canary_drop_half
 check forbidden_code       audit tests/algs/bad_audit
 check native_c_code        True  tests/algs/native_c
 check forbidden_native     audit tests/algs/bad_native
+# pre-check: an algorithm that does not reduce the pipeline scatter gets no injection runs at screen
+res=$(RVSWARM_ALLOW_UNSANDBOXED=1 RVSWARM_TEST_BACKEND='{"kind": "synth", "seed": 3, "n_days": 900, "obs_per_day": 1, "day_keep": 0.33}' \
+      "$PY" -m harness.evaluate --alg-dir tests/algs/no_gain --stage screen --out-root "$OUT/no_gain" | tail -1)
+if [ -f "$OUT/no_gain/screen_01/metrics.json" ] && grep -q '"injection_skipped": true' "$OUT/no_gain/screen_01/metrics.json"; then
+  echo "ok    precheck_skips_injection"; else echo "FAIL  precheck_skips_injection :: $res"; fail=1; fi
 rm -rf "$OUT"
 [ $fail = 0 ] && echo "ALL SELF-TESTS PASSED" || { echo "SELF-TEST FAILURES"; exit 1; }

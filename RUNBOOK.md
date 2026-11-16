@@ -35,8 +35,10 @@ Contents
  │ 3 skeptics ◄─► proposers, N rounds ─► CRITIQUE_*.md  │      │ harness.evaluate            │
  │ proposers ─► SPEC.md (final)                         │      │   audit code                │
  │ 2 moderators + fixed quota rule ─► SELECTION.md      │      │   run on data (no planets)  │
- │ implementers (tools, toy self-test) ─► algorithms/…  │tickets│   run on data + hidden      │
- │ reviewer ─► REVIEW.md ──────────────────────────────────────►│     planets (1-2 times)     │
+ │ implementers (tools, toy self-test) ─► algorithms/…  │      │   pre-check: scatter below  │
+ │ code reviewer + numerical analyst, then              │      │     pipeline? else stop     │
+ │ performance engineer ─► REVIEW.md ──────────────────tickets─►│   run on data + hidden      │
+ │                                                      │      │     planets (1-2 times)     │
  │                                                      │      │   score, write report.md    │
  │ proposers ◄─ results/…/report.md ◄──────────────────────────── results/<alg>/<stage>_NN/  │
  │   └► postmortems/*.md ─► seminar ─► next proposals   │      └─────────────────────────────┘
@@ -163,6 +165,8 @@ The defaults are reasonable; the ones worth a conscious decision:
 * `partitions.sealed_fraction` (0.30): the last 30 % of observing days are sealed.
 * `injection.bands_days`, `k_range_ms`: one hidden planet per band, 8-25 cm/s.
 * `gates.transfer_range` ([0.8, 1.2]) and `target_rms_ms` (0.20).
+* `precheck` (screen stage, ratio 0.95): no planet injection for an algorithm that does
+  not reduce the scatter of the pipeline RVs (section 10.1).
 * `data.toy_l2_dir`: the few real frames for the implementers' self-test (section 4.0).
 * `resources`: per-evaluation caps on CPUs, memory, GPU, hours.
 
@@ -539,7 +543,7 @@ normal cycle.
 | `classify` | registrar (routine) | family id, novelty score; new families when warranted |
 | `debate` | 3 skeptics review, the proposer revises; repeated `cycle.debate_rounds` (5) times (reasoning) | per-round critiques and drafts, final `SPEC.md`, `DEBATE_SUMMARY.md` |
 | `moderate` | 2 moderators rank; a fixed rule applies quotas | `SELECTION.md`: 12 ideas, redirects, seminar topics |
-| `implement` | implementer with file tools and toy self-test, then an independent reviewer, up to 4 fix rounds (implementer tier) | code + notes + review; ticket for the cluster |
+| `implement` | implementer with file tools and toy self-test; then a code reviewer and a numerical analyst in parallel, up to 4 fix rounds; then a performance engineer and, if it asks, one optimisation pass with a fresh review (implementer tier) | code + notes + `REVIEW.md`; ticket for the cluster |
 | `crosspollinate` | synthesist (reasoning); every 3rd cycle after the independent phase | briefs addressed to specific proposers |
 | `digest` | reporter (clerical) | one-page summary for you |
 | `submit` | none | runs `submit_command` if configured |
@@ -559,7 +563,7 @@ How your design points are implemented:
 * **Registry of approach families**: `workspace/registry/REGISTRY.md`. Ten seed
   families; the registrar can add more.
 * **No dominance by early results**: at most 30 % of a cycle's selections per family;
-  2 of the 10 places reserved for novel ideas in families with nothing yet selected;
+  3 of the 12 places reserved for novel ideas in families with nothing yet selected;
   moderators are instructed to weight information and difference in kind, and the
   quota is enforced in code after them.
 * **Redirection on convergence**: when one family exceeds 34 % of the last three
@@ -574,6 +578,17 @@ How your design points are implemented:
 * **Clear documents between proposers and implementers**: the implementer receives
   only `SPEC.md` and the interface documents; deviations go in
   `IMPLEMENTATION_NOTES.md`; an independent reviewer checks fidelity.
+* **Numerical analyst (a skeptic of the code)**: in every review round a second agent,
+  independent of the code reviewer, looks only for numerical faults: index base and
+  array layout (0-based Python/C against 1-based Fortran/Julia), precision against the
+  10 cm/s goal, conditioning, convergence, NaN handling. Either reviewer can send the
+  code back. Switch: `cycle.numerics_review`.
+* **Performance engineer (a consultant)**: once the code has passed both reviewers, a
+  third agent looks for wasted CPU time and an oversized resource request. If it asks
+  for changes the implementer makes one optimisation pass, the harness compares the test
+  output before and after, and both reviewers look again. If the optimised code does not
+  pass, the reviewed un-optimised code is evaluated instead, so the consultant can never
+  cost a working implementation. Switch: `cycle.performance_review`.
 * **Agents may request intermediate checks**: proposals list diagnostics, emitted by
   the algorithm through `ctx.metric` / `ctx.diagnostic` and printed in the result
   report. Requests for harness-side changes land in `workspace/diagnostic_requests/`
@@ -694,7 +709,31 @@ protections, roughly in order of importance:
    published runs would otherwise reveal the planets).
 8. **Canaries.** Three deliberate cheaters are evaluated with the baselines. If one
    ever passes the gate, the harness is broken: stop and fix it.
-9. **Independent code review** for fidelity and integrity before anything is queued.
+9. **Independent code review** for fidelity and integrity before anything is queued, and a
+   separate numerical review.
+
+### 10.1 Saving CPU time on the cluster
+
+* **Pre-check before injection** (`precheck` in `config/harness.yaml`). At the screen
+  stage the un-injected run is scored first. If the RMS per epoch of the corrected RVs is
+  not below 0.95 times that of the pipeline RVs (CCFRVMOD), the injected run is skipped
+  and the result is a gate failure with `injection_skipped: true`. For such an algorithm
+  this halves the CPU time of the screen evaluation. The threshold equals
+  `promotion.screen_to_full_max_ratio` on purpose: the effective RMS is never smaller
+  than the plain RMS, so nothing that is skipped could have been promoted. The rule is
+  fixed code and uses only the un-injected data, so it tells an agent nothing about the
+  hidden planets. Baselines and canaries always get their injections. What is lost: the
+  planet transfer of methods that do not reduce the scatter is no longer measured.
+  `stages: []` switches the pre-check off.
+* **Run order.** The un-injected run now always goes first, on all granted cores;
+  injected runs follow (concurrently when the algorithm sets `parallel_runs: true`).
+* **Performance engineer** before queueing (section 7), who also trims the resource request.
+* **CPU accounting.** Each report and `metrics.json` gives `cpu_core_hours` and
+  `cpu_utilisation` (CPU time used / cores reserved x wall time). Low utilisation across
+  many algorithms means the requests are too large: lower `resources.default` or
+  `resources.max_cpus` in `config/harness.yaml`.
+* Not changed, for you to decide: the defaults of 8 CPUs and 4 hours per algorithm, and
+  the caps (32 CPUs; 8 / 16 / 24 hours per stage).
 
 **The container is not optional.** An independent adversarial review of this harness
 confirmed that the static audit can be bypassed by determined code (for example through
@@ -753,7 +792,8 @@ queries its value erodes; and the ten-centimetre criterion is evaluated on the S
 * The shared project documents are sent as a cached system prompt. Tool-using agents
   (implementers, librarian) use the 1-hour cache (`api.agent_cache_ttl`).
 * Implementation is the expensive phase. To spend less: lower `select_per_cycle`,
-  `implement_max_turns` or `implement_fix_rounds`.
+  `implement_max_turns` or `implement_fix_rounds`, or switch off `numerics_review` or
+  `performance_review`.
 
 ### 11.2 What the trial run measured (2026-11-15)
 
@@ -788,22 +828,26 @@ In the debate no proposal settled in round 1 and 3 of 5 settled in round 2.
 
 Per swarm, with 24 proposers, 5 debate rounds and 12 implementations:
 
-    cost of a cycle  =  3 USD x proposals  +  18 USD x implementations  +  overheads
+    cost of a cycle  =  3 USD x proposals  +  25 USD x implementations  +  overheads
 
 * **3 USD per proposal** = the proposal (0.92) plus its share of critiques and revisions
   through the debate, at the settling rate seen in the trial. Measured.
-* **18 USD per implementation**, including its reviews and repairs. **This is an estimate,
+* **25 USD per implementation**, including its reviews and repairs. **This is an estimate,
   not a measurement.** The trial measured 8 USD of useful spending with 45 turns and no
   repair rounds used; the full configuration allows 70 turns and 4 repair rounds, and the
-  1-hour cache costs 1.6 times more per write. A plausible range is 12 to 25 USD.
+  1-hour cache costs 1.6 times more per write: about 18 USD. The numerical analyst and
+  the performance engineer were added after the trial and add about 7 USD: a second
+  review call in every round (the trial's review calls cost about 1.2 USD each), one
+  performance consultation, and, in the cases where it asks for changes (assumed: half),
+  an optimisation pass with a fresh review. A plausible range is 16 to 35 USD.
 * **Overheads**: moderators (about 2 USD), post-mortems (one per finished evaluation, not
   measured; assume 1 USD each), seminars and digest (a few USD), and a literature refresh
   every sixth cycle (about 60 USD, so 10 USD per cycle on average).
 
 | | proposals | implementations | expected cost (USD) |
 |---|---|---|---|
-| a normal cycle | 24 | 12 | about 320 (range 250 to 450) |
-| cycle 1 (adds the literature build and 6 reproductions) | 30 | 18 | about 500 (range 400 to 650) |
+| a normal cycle | 24 | 12 | about 400 (range 300 to 550) |
+| cycle 1 (adds the literature build and 6 reproductions) | 30 | 18 | about 620 (range 480 to 800) |
 
 Later cycles carry more history in each prompt, so expect the cost per cycle to drift
 upwards over the run. The upper ends of the ranges allow for that.
@@ -820,17 +864,17 @@ cycle every one to two days a swarm completes 90 to 180 cycles in six months.
 
 | per swarm | cycles in 6 months | cost per cycle (USD) | six months (USD) |
 |---|---|---|---|
-| slow, cheap | 90 | 250 | 23 000 |
-| expected | 120 | 320 | 39 000 |
-| fast, expensive | 180 | 450 | 81 000 (stops at the 66 000 limit) |
+| slow, cheap | 90 | 300 | 27 000 |
+| expected | 120 | 400 | 48 000 |
+| fast, expensive | 180 | 550 | 99 000 (stops at the 66 000 limit) |
 
 | three swarms | six months (USD) |
 |---|---|
-| slow, cheap | 69 000 |
-| expected | about 117 000 |
+| slow, cheap | 81 000 |
+| expected | about 144 000 |
 | upper bound enforced by the limits | 198 000 |
 
-So the expected spending is about 60 % of the budget, and the limits in
+So the expected spending is about 70 % of the budget, and the limits in
 `config/swarm.yaml` (66 000 USD in total and 11 000 USD per month for each swarm)
 guarantee that the three ledgers together cannot pass 198 000 USD. The remaining 2 000
 USD covers overshoot of work in flight and the difference between the ledger and the
@@ -839,11 +883,11 @@ invoice.
 What to do with these numbers:
 
 * **After the first five cycles of one swarm**, run `bin/swarm.sh costs` and replace the
-  18 USD and the cycle duration above with what was measured. Those two numbers carry
+  25 USD and the cycle duration above with what was measured. Those two numbers carry
   almost all of the uncertainty.
 * **If spending runs ahead** (more than 11 000 USD per swarm per month), the monthly
-  limit pauses the swarm. Lower `select_per_cycle` or `implement_fix_rounds` rather than
-  waiting for the month to end.
+  limit pauses the swarm. Lower `select_per_cycle` or `implement_fix_rounds`, or switch
+  off `performance_review`, rather than waiting for the month to end.
 * **If spending runs well below** the budget after two months, the spare money is best
   used on `implement_fix_rounds`, on `select_per_cycle`, or on enlarging the curated
   sets (which costs cluster time, not API money) -- not on more proposers.
@@ -866,6 +910,7 @@ What to do with these numbers:
 | ticket stuck in `state/eval_submitted/` | the SLURM job died without reporting. After job time + 3 days it is closed automatically as `job_lost`; to retry sooner, move the file back to `state/eval_queue/` |
 | result `status: audit_failed` | the report lists the offending lines; the proposer sees it in the post-mortem phase |
 | result `status: run_failed` | traceback is in the report; SLURM log in `state/slurm_logs/` |
+| result has `injection_skipped: true` | the pre-check found no reduction of the pipeline scatter, so no planets were injected (section 10.1). Not an error |
 | many `implementation_failed` | read `workspace/algorithms/<id>/REVIEW.md`; specs may be too ambitious for the turn limit -- raise `implement_max_turns` |
 | algorithm needs a package | add to `audit.allowed_imports`, install on the cluster and orchestrator, document in `ALGORITHM_INTERFACE.md` |
 | `Refusing to submit` / result `status: no_sandbox` | set `RVSWARM_SANDBOX_CMD` (section 10) or `RVSWARM_ALLOW_UNSANDBOXED=1`; then re-queue with `bin/py.sh -m harness.promote enqueue --alg <id>` |
@@ -878,7 +923,8 @@ Tested with the live API (trial run of 2026-11-15, section 11.2): one reduced cy
 through every phase that occurs in cycle 1 -- literature with web search, proposals,
 classification, two debate rounds, moderation, four implementations with code review,
 digest. Not yet exercised live: post-mortems, seminars, cross-pollination, repair
-rounds after a failed review, and the 1-hour cache setting (added after the trial).
+rounds after a failed review, the 1-hour cache setting, the numerical analyst and the
+performance engineer (all added after the trial).
 
 Tested here:
 
@@ -887,6 +933,10 @@ Tested here:
 * The complete harness path on a synthetic Sun with the real array shapes: audit,
   subprocess runs, scoring, reports, promotion, tickets, `submit_eval.sh --local`.
 * Honest baselines pass and all three canaries and the forbidden-code example fail.
+* The pre-check: an algorithm that returns the pipeline RV gets no injection run at the
+  screen stage; baselines still get theirs (`tests/selftest.sh`, 10 checks).
+* The numerical analyst, the performance engineer, the optimisation pass and the
+  restoring of the reviewed code when the optimised code fails review, with mock replies.
 * The whole orchestration (all phases, two consecutive cycles) with mock model replies.
 
 Not tested here, because this container has no API key, no `sbatch` and only 16

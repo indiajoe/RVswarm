@@ -56,6 +56,14 @@ def respond(role: str, user: str, schema, tag: str):
     if role == "review":
         return {"verdict": "pass", "fidelity_issues": [], "correctness_issues": [], "integrity_issues": [],
                 "summary": "mock review: fine"}
+    if role == "numerics":
+        return {"verdict": "pass", "numerical_issues": [], "summary": "mock numerics review: fine"}
+    if role == "performance":
+        opt = _h(tag, 2) == 0
+        return {"verdict": "optimise" if opt else "ok",
+                "changes": ["mock: read each spectrum once"] if opt else [],
+                "recommended_resources": {"cpus": 1, "mem_gb": 4, "hours": 0.5, "parallel_runs": False},
+                "estimated_core_hours_screen": 0.1, "summary": "mock performance advice"}
     if role in ("propose", "reproduce", "revise"):
         extra = f"\n\n## Response to reviewers\nmock revision {_h(user, 10**6)}\n" if role == "revise" else ""
         return PROPOSAL.format(tag=tag.split(":")[-1]) + extra
@@ -73,7 +81,7 @@ def agent(role: str, user: str, toolset, tag: str) -> str:
         return "mock library written"
     m = re.search(r"algorithms/([A-Za-z0-9_]+)/", user)
     alg = m.group(1)
-    if "asked for changes" not in user:
+    if "asked for changes" not in user and "performance engineer recommends" not in user:
         toolset.execute("write_file", {"path": f"algorithms/{alg}/algorithm.py", "content": ALGO})
         toolset.execute("write_file", {"path": f"algorithms/{alg}/algorithm.yaml",
                                        "content": "name: mock\nfamily: F03\nresources: {cpus: 2, mem_gb: 8, hours: 1, gpus: 0}\n"})

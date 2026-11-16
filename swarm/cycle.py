@@ -32,7 +32,7 @@ from harness import promote
 
 from . import prompts, registry
 from .llm import LLM, BudgetExceeded, Refused
-from .tools import ROOT, WORKSPACE, Toolset, run_toy
+from .tools import ROOT, WORKSPACE, Toolset, run_toy, toy_fingerprint
 
 STATE = ROOT / "state"
 STATE_FILE = STATE / "swarm_state.json"
@@ -680,32 +680,81 @@ class Cycle:
         ts = Toolset(read_roots=["docs", "literature"] + refs + [f"algorithms/{x}" for x in parents],
                      write_roots=[f"algorithms/{pid}"], alg_dir=alg_dir, allow_tests=True)
         review, toy_ok, toy_report = {}, False, ""
+        use_num, use_perf = self.c.get("numerics_review", True), self.c.get("performance_review", True)
+        max_rounds = self.c["implement_fix_rounds"]
+        backup = STATE / "pre_optimisation" / pid       # the reviewed code, kept while it is being optimised
+        shutil.rmtree(backup, ignore_errors=True)
+        perf, perf_note, before, rnd = None, "", None, 0
         try:
             self.llm.agent("implement", self.system, prompts.implement_prompt(pid, parents), ts,
                            self.c["implement_max_turns"], tag=f"{self.tag('implement')}:{pid}")
-            for rnd in range(self.c["implement_fix_rounds"] + 1):
+            while True:
                 if not (alg_dir / "algorithm.py").exists():
                     toy_ok, toy_report = False, "algorithm.py was never written"
                 else:
                     self._fix_manifest(alg_dir, p)
                     toy_report, toy_ok = run_toy(alg_dir)
-                review = self.llm.call("review", self.system, prompts.review_prompt(
-                    pid, read(alg_dir / "SPEC.md", 40000), self._alg_files(alg_dir), toy_report),
-                    prompts.REVIEW_SCHEMA, tag=f"{self.tag('review')}:{pid}#{rnd}")
-                (alg_dir / "REVIEW.md").write_text(
-                    f"# Code review of {pid} (round {rnd + 1})\n\nVerdict: **{review['verdict']}**; toy run "
-                    f"{'completed' if toy_ok else 'FAILED'}\n\n{review['summary']}\n\n"
-                    + "\n".join(f"- [{k.split('_')[0]}] {i}" for k in ("integrity_issues", "fidelity_issues",
-                                                                       "correctness_issues") for i in review.get(k, []))
-                    + "\n")
-                if (review["verdict"] == "pass" and toy_ok) or review["verdict"] == "reject" \
-                        or rnd == self.c["implement_fix_rounds"]:
+                if before is not None:                   # first test after the optimisation pass
+                    after = toy_fingerprint(alg_dir)
+                    if after is None or len(after) != len(before):
+                        change = "could not be compared (the test run failed or changed shape)"
+                    else:
+                        d = max((abs(x - y) for x, y in zip(before, after) if x == x and y == y), default=0.0)
+                        change = f"largest change of any reported number: {d:.3g} (m/s for RVs)"
+                    toy_report += ("\n\nHARNESS CHECK after the performance optimisation pass, same test data "
+                                   f"before and after: {change}. An optimisation must change results by "
+                                   "rounding only.")
+                    before = None
+                spec, files = read(alg_dir / "SPEC.md", 40000), self._alg_files(alg_dir)
+                with ThreadPoolExecutor(2) as ex:        # code reviewer and numerical analyst, independently
+                    f_rev = ex.submit(self.llm.call, "review", self.system, prompts.review_prompt(
+                        pid, spec, files, toy_report), prompts.REVIEW_SCHEMA, f"{self.tag('review')}:{pid}#{rnd}")
+                    f_num = ex.submit(self.llm.call, "numerics", self.system, prompts.numerics_prompt(
+                        pid, spec, files, toy_report), prompts.NUMERICS_SCHEMA,
+                        f"{self.tag('numerics')}:{pid}#{rnd}") if use_num else None
+                    review = f_rev.result()
+                    num = f_num.result() if f_num else {"verdict": "pass", "numerical_issues": [], "summary": "not run"}
+                review["numerical_issues"] = num.get("numerical_issues", [])
+                if num["verdict"] == "fix" and review["verdict"] == "pass":
+                    review["verdict"] = "fix"
+                passed = review["verdict"] == "pass" and toy_ok
+
+                def write_review() -> None:
+                    (alg_dir / "REVIEW.md").write_text(
+                        f"# Review of {pid} (round {rnd + 1})\n\nVerdict: **{review['verdict']}**; test run "
+                        f"{'completed' if toy_ok else 'FAILED'}\n\n## Code reviewer\n\n{review['summary']}\n\n"
+                        + "\n".join(f"- [{k.split('_')[0]}] {i}" for k in ("integrity_issues", "fidelity_issues",
+                                                                           "correctness_issues") for i in review.get(k, []))
+                        + f"\n\n## Numerical analyst\n\n{num.get('summary', '')}\n\n"
+                        + "\n".join(f"- [numerical] {i}" for i in review["numerical_issues"])
+                        + perf_note + "\n")
+
+                write_review()
+                if passed and use_perf and perf is None:
+                    perf = self.llm.call("performance", self.system, prompts.performance_prompt(
+                        pid, spec, files, toy_report), prompts.PERFORMANCE_SCHEMA,
+                        tag=f"{self.tag('performance')}:{pid}")
+                    perf_note = (f"\n\n## Performance engineer\n\nVerdict: **{perf['verdict']}**. {perf.get('summary', '')}\n\n"
+                                 f"- recommended resources: {perf.get('recommended_resources')}\n"
+                                 f"- estimated CPU time of a screen evaluation: {perf.get('estimated_core_hours_screen')} core-hours\n"
+                                 + "\n".join(f"- [performance] {c}" for c in perf.get("changes", [])))
+                    write_review()
+                    if perf["verdict"] == "optimise" and perf.get("changes"):
+                        shutil.copytree(alg_dir, backup, ignore=shutil.ignore_patterns("__pycache__"))
+                        before = toy_fingerprint(alg_dir)
+                        self.llm.agent("implement", self.system, prompts.optimise_prompt(pid, perf), ts,
+                                       self.c["implement_max_turns"] // 2, tag=f"{self.tag('optimise')}:{pid}")
+                        rnd += 1
+                        max_rounds = max(max_rounds, rnd + 1)     # the optimised code gets one repair round
+                        continue
+                if passed or review["verdict"] == "reject" or rnd >= max_rounds:
                     break
                 if not toy_ok:
                     review.setdefault("correctness_issues", []).append(
-                        "The toy run does not complete. Report:\n" + toy_report[-3000:])
+                        "The test run does not complete. Report:\n" + toy_report[-3000:])
                 self.llm.agent("implement", self.system, prompts.fix_prompt(pid, review), ts,
                                self.c["implement_max_turns"] // 2, tag=f"{self.tag('fix')}:{pid}#{rnd}")
+                rnd += 1
         except Refused as e:
             review = {"verdict": "reject", "summary": f"model declined: {e}"}
         except (BudgetExceeded, anthropic.AuthenticationError, anthropic.PermissionDeniedError):
@@ -713,6 +762,17 @@ class Cycle:
         except Exception as e:                      # one broken implementation must not stop the cycle
             log(f"implement {pid}: {type(e).__name__}: {e}")
             review = {"verdict": "reject", "summary": f"orchestrator error: {type(e).__name__}: {e}"}
+        if backup.exists() and not (review.get("verdict") == "pass" and toy_ok):
+            # the optimised code did not pass review again: evaluate the reviewed, slower code
+            shutil.rmtree(alg_dir)
+            shutil.copytree(backup, alg_dir)
+            with open(alg_dir / "REVIEW.md", "a") as fh:
+                fh.write("\n## Optimisation withdrawn\n\nThe code changed in the performance pass did not "
+                         "pass review again, so the reviewed code from before that pass was restored and "
+                         "is the one evaluated.\n")
+            review, toy_ok = {"verdict": "pass", "summary": "restored pre-optimisation code"}, True
+            log(f"implement {pid}: optimisation withdrawn, reviewed code restored")
+        shutil.rmtree(backup, ignore_errors=True)
         if review.get("verdict") == "pass" and toy_ok:
             promote.enqueue(pid, "screen")
             status = "queued:screen"

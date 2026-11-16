@@ -58,6 +58,17 @@ gates:
   min_valid_fraction: 0.95       # finite outputs required
   target_rms_ms: 0.20            # the goal: effective RMS per epoch below this (m/s)
 
+# Pre-check before the injection-recovery runs, to save CPU time. At the listed stages the
+# un-injected run is scored first; if the RMS per epoch of the corrected RVs is not below
+# max_rms_ratio x that of the pipeline RVs (CCFRVMOD), the injected runs are skipped and
+# the result is a gate failure. Keep max_rms_ratio equal to promotion.screen_to_full_max_ratio:
+# effective RMS can only be larger than the plain RMS, so an algorithm skipped here could
+# not have been promoted anyway. baseline_* and canary_* always get their injections.
+# `stages: []` switches the pre-check off.
+precheck:
+  stages: [screen]
+  max_rms_ratio: 0.95
+
 promotion:                       # applied by harness/promote.py -- no agent input
   screen_to_full_max_ratio: 0.95       # effective_rms / raw_rms must be below this
   full_to_sealed_max_ratio: 0.60

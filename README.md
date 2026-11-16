@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="RVswarmLogo.png" alt="RVswarm: agents that quiet the star to reveal habitable-zone Earths" width="720">
+</p>
+
 # RV-Swarm
 
 A swarm of Claude agents that proposes, debates, implements and evaluates algorithms

@@ -3,8 +3,10 @@
     python -m harness.evaluate --alg <alg_id> --stage screen|full|sealed
     python -m harness.evaluate --alg-dir path/to/dir --stage toy      # local: a few real frames, or synthetic
 
-The algorithm is run once without and n times with hidden injected planets, each
-in a fresh process. Results go to workspace/results/<alg_id>/<stage>_<NN>/.
+The algorithm is run once without hidden planets and then n times with them, each in a
+fresh process. At the stages listed under `precheck` in config/harness.yaml the injected
+runs are skipped (to save CPU time) when the un-injected run does not reduce the scatter
+of the pipeline RVs. Results go to workspace/results/<alg_id>/<stage>_<NN>/.
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import resource
 import shlex
 import shutil
 import subprocess
@@ -116,6 +119,28 @@ def write_report(out: Path, alg_id: str, stage: str, m: dict, man: dict, runs: l
         L += ["| " + " | ".join(f"{x:.4f}" for x in row) + " |" for row in m["smoke_rows"]]
         L += ["", "For a method that preserves planets, the last two columns agree, apart from whatever "
               "the method legitimately cannot determine from so few spectra (for example a constant offset)."]
+    elif m.get("injection_skipped"):
+        L += [f"- observations scored: {m['n_obs']} on {m['n_days']} days "
+              f"(baseline {m['baseline_days']:.0f} d)", "",
+              "## Pre-check failed: no planet injection was run", "",
+              "Before spending CPU time on the injection-recovery runs, the harness compares the scatter of "
+              "the corrected RVs with that of the pipeline RVs (`rv_pipeline`, the DRP's CCFRVMOD) on the "
+              "un-injected data. The corrected scatter must be below "
+              f"{m['precheck_max_ratio']:.2f} x the pipeline scatter. It was not, so this algorithm could "
+              "not have been promoted whatever its planet transfer, and the injected runs were skipped. "
+              "Planet transfer is therefore NOT measured in this report.", "",
+              "| quantity | value |", "|---|---|",
+              f"| pipeline RV, RMS per epoch (m/s) | {m['rms_raw_daily']:.4f} |",
+              f"| **corrected RV, RMS per epoch (m/s)** | **{m['rms_null_daily']:.4f}** |",
+              f"| ratio corrected / pipeline | {m['precheck_ratio']:.3f} (needed: below {m['precheck_max_ratio']:.2f}) |",
+              f"| robust (MAD) daily RMS (m/s) | {m['robust_rms_null_daily']:.4f} |",
+              f"| valid output fraction | {m['valid_fraction']:.3f} (per observation), {m['day_fraction']:.3f} (per day) |",
+              "", "## Scatter versus timescale (m/s)", "",
+              "| bin | pipeline | corrected |", "|---|---|---|",
+              f"| single observation | {m['rms_raw_per_obs']:.4f} | {m['rms_null_per_obs']:.4f} |",
+              f"| 1 day | {m['rms_raw_daily']:.4f} | {m['rms_null_daily']:.4f} |"]
+        for n in ("2", "4", "8", "16", "32"):
+            L.append(f"| {n} days | {m['rms_raw_multiday'][n]:.4f} | {m['rms_null_multiday'][n]:.4f} |")
     else:
         L += [f"- observations scored: {m['n_obs']} on {m['n_days']} days "
               f"(baseline {m['baseline_days']:.0f} d)", "",
@@ -153,7 +178,10 @@ def write_report(out: Path, alg_id: str, stage: str, m: dict, man: dict, runs: l
             L.append(f"| {n} days | {m['rms_raw_multiday'][n]:.4f} | {m['rms_null_multiday'][n]:.4f} |")
     L += ["", "## Run facts", "",
           f"- resources: {man['resources']}",
-          "- runtimes (s): " + ", ".join(f"{r['runtime_s']:.0f}" for r in runs),
+          "- wall time per run (s): " + ", ".join(f"{r['runtime_s']:.0f}" for r in runs),
+          f"- CPU time of all runs together: {m.get('cpu_core_hours', float('nan')):.3f} core-hours "
+          f"({m.get('cpu_utilisation', float('nan')):.0%} of the cores that were reserved for that long). "
+          "Low utilisation means the request was larger than the code can use.",
           "- run statuses: " + ", ".join(r["status"] for r in runs)]
     if publish_details and runs:
         r0 = runs[0]
@@ -300,18 +328,49 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
                 "max_diag_bytes": cfg["audit"]["max_diagnostic_bytes"]}
         (work / f"view_{r}.json").write_text(json.dumps(view))
         plans.append({"planets": planets, "truth": s})
-    par = n_runs if (res["parallel_runs"] and res["gpus"] == 0) else 1
-    cpus_each = max(1, res["cpus"] // par)
-    timeout = hours * 3600 / (n_runs / par)
+    # The un-injected run goes first, alone, on all granted cores. The injected runs follow,
+    # concurrently if the algorithm asked for that (then each of the two phases gets half
+    # of the wall time).
+    par = (n_runs - 1) if (res["parallel_runs"] and res["gpus"] == 0) else 1
+    timeout = hours * 3600 / (2 if par > 1 else n_runs)
     py = sys.executable
 
-    def go(r: int) -> dict:
+    def go(r: int, cpus: int) -> dict:
         return run_one(py, snap, work / f"view_{r}.json", work / f"out_{r}.npz", work / f"scratch_{r}",
                        out / f"run_{r}.log" if publish and r == 0 else work / f"run_{r}.log",
-                       res, timeout, cpus_each)
+                       res, timeout, cpus)
 
-    with ThreadPoolExecutor(max_workers=par) as ex:
-        runs = list(ex.map(go, range(n_runs)))
+    def cpu_seconds() -> float:
+        u = resource.getrusage(resource.RUSAGE_CHILDREN)
+        return u.ru_utime + u.ru_stime
+
+    cpu0, wall0 = cpu_seconds(), time.time()
+    runs = [go(0, res["cpus"])]
+    # Pre-check (fixed rule, config `precheck`): no reduction of the pipeline scatter -> the
+    # algorithm cannot be promoted whatever its planet transfer, so the injections are skipped.
+    pre = cfg.get("precheck") or {}
+    skipped = None
+    if (stage in (pre.get("stages") or []) and runs[0]["status"] == "ok"
+            and not alg_id.startswith(("baseline_", "canary_"))):
+        m0 = score.score(t, be.day[index], be.rv_err[index], be.rv[index], runs[0]["rv_clean"],
+                         [], t0, cfg["gates"], cfg["data"]["min_obs_per_day"], score_days)
+        if m0.get("status") == "ok":
+            ratio = m0["rms_null_daily"] / m0["rms_raw_daily"] if m0["rms_raw_daily"] > 0 else float("inf")
+            if not ratio < float(pre["max_rms_ratio"]):          # also catches NaN
+                skipped = dict(m0, injection_skipped=True, precheck_ratio=float(ratio),
+                               precheck_max_ratio=float(pre["max_rms_ratio"]), gate_pass=False,
+                               meets_target=False, min_transfer=None, max_transfer=None,
+                               effective_rms=None, improvement_over_raw=None, k_detect_5sigma=None,
+                               gate_reasons=[f"pre-check: corrected scatter is {ratio:.3f} x the pipeline "
+                                             f"scatter (needed: below {pre['max_rms_ratio']}); "
+                                             "injection-recovery not run"])
+    if runs[0]["status"] == "ok" and skipped is None:
+        with ThreadPoolExecutor(max_workers=par) as ex:
+            runs += list(ex.map(lambda r: go(r, max(1, res["cpus"] // par)), range(1, n_runs)))
+    cpu_s, wall_s = cpu_seconds() - cpu0, time.time() - wall0
+    meta["cpu_core_hours"] = cpu_s / 3600
+    meta["wall_hours"] = wall_s / 3600
+    meta["cpu_utilisation"] = cpu_s / max(wall_s * res["cpus"], 1e-9)
     truth_dir = config.STATE / "truth" / alg_id
     truth_dir.mkdir(parents=True, exist_ok=True)
     (truth_dir / f"{out.name}.json").write_text(json.dumps(
@@ -319,6 +378,11 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
 
     if runs[0]["status"] != "ok":
         result = finish({"status": "run_failed", "error": runs[0]["error"], "gate_pass": False})
+    elif skipped is not None:
+        skipped["algorithm_metrics"] = runs[0]["metrics"] if publish else {}
+        if publish and runs[0]["diags"]:
+            np.savez_compressed(out / "diagnostics.npz", **runs[0]["diags"])
+        result = finish(skipped)
     elif smoke:
         # Too few spectra for any statistic: report only whether the code ran and what it returned.
         c0, r1 = runs[0]["rv_clean"], runs[1]

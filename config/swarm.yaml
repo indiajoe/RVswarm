@@ -23,6 +23,8 @@ roles:
   crosspollinate:  {model: reasoning,   effort: high,   max_tokens: 32000}
   implement:       {model: implementer, effort: high,   max_tokens: 64000}
   review:          {model: implementer, effort: high,   max_tokens: 32000}
+  numerics:        {model: implementer, effort: high,   max_tokens: 32000}   # numerical analyst (skeptic of the code)
+  performance:     {model: implementer, effort: high,   max_tokens: 32000}   # performance engineer (CPU time)
   classify:        {model: routine,     effort: low,    max_tokens: 4000}
   minutes:         {model: routine,     effort: medium, max_tokens: 8000}
   digest:          {model: clerical,    effort: medium, max_tokens: 8000}
@@ -49,7 +51,7 @@ pricing:
 # Limits for THIS swarm. Three independent swarms share 200 000 USD over six months, so
 # each gets a third: 3 x 66 000 = 198 000. See RUNBOOK section 11.
 budget:                      # the orchestrator stops cleanly when any limit is reached
-  usd_per_cycle: 1200        # a normal cycle is expected near 300-400; cycle 1 near 600
+  usd_per_cycle: 1200        # a normal cycle is expected near 400; cycle 1 near 620
   usd_per_month: 11000       # reached -> pauses until the next calendar month
   usd_total: 66000
 
@@ -82,6 +84,10 @@ cycle:
   literature_refresh_every: 6    # cycles
   implement_max_turns: 70        # tool turns for the first implementation pass (trial: one of four hit 45)
   implement_fix_rounds: 4        # review -> fix rounds; each fix pass gets half the turns above
+  numerics_review: true          # a numerical analyst reviews the code in every round, next to the code reviewer
+  performance_review: true       # once the code passes, a performance engineer is consulted; if it asks for
+                                 # changes the implementer makes one optimisation pass and the code is reviewed
+                                 # again (if that review fails, the reviewed un-optimised code is used)
   max_postmortems_per_cycle: 16
   submit_command: ""             # e.g. "bin/submit_eval.sh" if this host has sbatch, or an ssh command
 

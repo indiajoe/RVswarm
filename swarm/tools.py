@@ -120,6 +120,21 @@ class Toolset:
         return text
 
 
+def toy_fingerprint(alg_dir: Path) -> list[float] | None:
+    """The numbers the last local test run of this algorithm produced (corrected RVs of the
+    smoke test, or the headline numbers on the synthetic Sun). Used to check that a
+    performance optimisation left the results unchanged."""
+    runs = sorted((ROOT / "state" / "toy_runs" / alg_dir.name).glob("toy_*/metrics.json"))
+    if not runs:
+        return None
+    m = json.loads(runs[-1].read_text())
+    if m.get("status") != "ok":
+        return None
+    if m.get("smoke"):
+        return [float(r[2]) for r in m.get("smoke_rows", [])]
+    return [float(m.get(k) or 0.0) for k in ("rms_null_daily", "min_transfer", "max_transfer")]
+
+
 def run_toy(alg_dir: Path, timeout_s: int = 2400) -> tuple[str, bool]:
     """Audit + toy evaluation in a subprocess. -> (report text, ran without error)."""
     out_root = ROOT / "state" / "toy_runs" / alg_dir.name
