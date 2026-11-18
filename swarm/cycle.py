@@ -6,11 +6,15 @@
     python -m swarm.cycle loop            cycle after cycle, each starting when the previous cycle's
                                           evaluation results are in, until the budget ends
     python -m swarm.cycle status
+    python -m swarm.cycle timing          rank algorithms, proposers and families by CPU time
+    python -m swarm.cycle move --to DIR   move proposers or families to another swarm (swarm/transfer.py)
 """
 from __future__ import annotations
 
 import argparse
 import difflib
+import errno
+import fcntl
 import json
 import math
 import os
@@ -22,6 +26,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import anthropic
@@ -36,6 +41,7 @@ from .tools import ROOT, WORKSPACE, Toolset, run_toy, toy_fingerprint
 
 STATE = ROOT / "state"
 STATE_FILE = STATE / "swarm_state.json"
+LOCAL_CFG = ROOT / "config" / "local_swarm.yaml"      # this swarm's own settings (not tracked by git)
 PHASES = ["sync_results", "literature", "postmortem", "seminar", "propose", "classify", "debate",
           "moderate", "implement", "crosspollinate", "digest", "submit"]
 RESULT_KEYS = ("status", "rms_raw_daily", "rms_null_daily", "min_transfer", "max_transfer",
@@ -56,15 +62,54 @@ def _merge(base: dict, over: dict) -> dict:
     return base
 
 
-def load_cfg() -> dict:
-    """config/swarm.yaml, optionally overlaid by the file named in $RVSWARM_SWARM_OVERLAY
-    (for example config/trial.yaml: a small, capped trial run)."""
+def load_cfg(env_overlay: bool = True) -> dict:
+    """config/swarm.yaml, overlaid by config/local_swarm.yaml (this swarm's own settings: its
+    proposer panel after a move, its scope, its pace) and then, if env_overlay, by the file
+    named in $RVSWARM_SWARM_OVERLAY (for example config/trial.yaml: a small, capped trial run)."""
     cfg = yaml.safe_load((ROOT / "config" / "swarm.yaml").read_text())
-    over = os.environ.get("RVSWARM_SWARM_OVERLAY")
+    if LOCAL_CFG.exists():
+        _merge(cfg, yaml.safe_load(LOCAL_CFG.read_text()) or {})
+    over = os.environ.get("RVSWARM_SWARM_OVERLAY") if env_overlay else None
     if over:
         p = Path(over)
         _merge(cfg, yaml.safe_load((p if p.is_absolute() else ROOT / p).read_text()) or {})
     return cfg
+
+
+def write_local_cfg(key: str, value) -> None:
+    """Set one top-level key of config/local_swarm.yaml (comments in that file are not kept)."""
+    d = (yaml.safe_load(LOCAL_CFG.read_text()) or {}) if LOCAL_CFG.exists() else {}
+    d[key] = value
+    LOCAL_CFG.write_text(
+        "# Settings of THIS swarm that differ from config/swarm.yaml. Not tracked by git.\n"
+        "# Keys here replace those in swarm.yaml; a list replaces the whole list. Rewritten by\n"
+        "# `bin/swarm.sh move` (comments are not kept). See RUNBOOK section 3.6.\n"
+        + yaml.safe_dump(d, sort_keys=False, default_flow_style=None, width=110))
+
+
+@contextmanager
+def swarm_lock():
+    """Held by every process that changes this swarm's state (run, loop, move, import), so that
+    a second one is refused instead of corrupting the registry."""
+    STATE.mkdir(exist_ok=True)
+    fh = open(STATE / "orchestrator.lock", "a+")
+    try:
+        try:
+            fcntl.lockf(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                fh.seek(0)
+                raise SystemExit(f"Another orchestrator process is working on this swarm ({ROOT}; "
+                                 f"pid and start time: {fh.read().strip() or 'unknown'}): bin/swarm.sh "
+                                 "run / loop / move / import. Stop it first.") from None
+            log(f"warning: no file locking on this file system ({e}); nothing stops two orchestrators")
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{os.getpid()} {time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+        fh.flush()
+        yield
+    finally:
+        fh.close()
 
 
 def load_state() -> dict:
@@ -129,6 +174,30 @@ def result_line(pid: str, stage: str, r: dict) -> str:
             f"effective_rms={fmt(r.get('effective_rms'))} gate={'PASS' if r.get('gate_pass') else 'FAIL'}")
 
 
+def refresh_results(pid: str, p: dict) -> int:
+    """Copy the finished evaluation results of one proposal into its registry entry.
+    -> number of new results. A proposal moved to another swarm keeps its results as a record."""
+    root = WORKSPACE / "results" / pid
+    if not root.exists() or p.get("moved_to"):
+        return 0
+    new = 0
+    order = {"screen": 0, "full": 1, "sealed": 2}             # so the status names the most advanced stage
+    for mf in sorted(root.glob("*/metrics.json"),
+                     key=lambda f: (order.get(f.parent.name.rsplit("_", 1)[0], 9), f.parent.name)):
+        if not (mf.parent / "DONE").exists():
+            continue
+        m = json.loads(mf.read_text())
+        stage = m.get("stage")
+        if stage not in ("screen", "full", "sealed") or m.get("status") == "no_sandbox":
+            continue
+        res = p.setdefault("results", {})
+        if res.get(stage, {}).get("run_dir") != m.get("run_dir"):
+            res[stage] = {k: m.get(k) for k in RESULT_KEYS}
+            p["status"] = f"evaluated:{stage}" if m.get("status") == "ok" else f"failed:{stage}"
+            new += 1
+    return new
+
+
 # ================================================================================================
 class Cycle:
     def __init__(self):
@@ -141,6 +210,9 @@ class Cycle:
         self.reg = registry.load()
         self.slots = {s["id"]: s for s in self.cfg["proposer_slots"]}
         self._system = None
+        # local self-tests of parallel implementers share this host's cores (harness/evaluate.py)
+        os.environ.setdefault("RVSWARM_TOY_CPUS", str(max(1, (os.cpu_count() or 2)
+                                                          // max(1, int(self.cfg["api"]["max_concurrency"])))))
 
     @property
     def system(self) -> str:
@@ -173,6 +245,26 @@ class Cycle:
             body = read(WORKSPACE / "literature" / "INDEX.md", 12000) + "\n\n" + body
         return body[:220000]
 
+    def scope_text(self) -> str:
+        """What this swarm works on (config `scope`, usually set in config/local_swarm.yaml)."""
+        sc = self.cfg.get("scope") or {}
+        parts = [str(sc["note"]).strip()] if sc.get("note") else []
+        if sc.get("allowed_uses"):
+            parts.append("A proposal is selected only if every data product listed in its `uses` front matter is "
+                         "one of: " + ", ".join(map(str, sc["allowed_uses"])) + ".")
+        return " ".join(parts)
+
+    def out_of_scope(self, pid: str) -> list[str]:
+        """Data products a proposal declares in `uses` that this swarm's scope does not allow."""
+        allowed = {str(u).strip().lower() for u in ((self.cfg.get("scope") or {}).get("allowed_uses") or [])}
+        if not allowed:
+            return []
+        fm, _ = front_matter(spec_text(pid, self.reg))
+        uses = fm.get("uses") or []
+        if isinstance(uses, str):
+            uses = [u for u in re.split(r"[,\s\[\]]+", uses) if u]
+        return sorted({str(u).strip().lower() for u in uses} - allowed)
+
     def informed_slots(self) -> set[str]:
         if self.n <= self.c["independence_cycles"]:
             return set()
@@ -200,10 +292,17 @@ class Cycle:
         out = []
         for i, (cyc, pid) in enumerate(mine):
             p = self.reg["proposals"][pid]
-            head = (f"#### {pid} (cycle {cyc}) \"{p.get('title', '')}\" -- family {p.get('family')}, "
-                    f"{'selected' if p.get('selected') else 'not selected this time'}, status: {p.get('status')}")
+            o = p.get("origin")
+            when = (f"cycle {cyc}" if not o else
+                    f"brought over from swarm {o['swarm']}, where it was {o['id']} of cycle {o.get('cycle')}")
+            head = (f"#### {pid} ({when}) \"{p.get('title', '')}\" -- family {p.get('family')}, "
+                    f"{'selected' if p.get('selected') else 'not selected'}, status: {p.get('status')}")
             lines = [head, p.get("summary", "")]
             lines += [result_line(pid, s, r) for s, r in (p.get("results") or {}).items()]
+            if o and p.get("origin_results"):
+                lines.append(f"Measured in swarm {o['swarm']}, on a DIFFERENT curated set of spectra (compare with "
+                             "care; this swarm evaluates the code again on its own data):")
+                lines += ["  " + result_line(pid, s, r) for s, r in p["origin_results"].items()]
             if i >= len(mine) - 4:
                 if p.get("decision"):
                     lines.append(f"Selection decision: {p['decision']}")
@@ -232,23 +331,7 @@ class Cycle:
 
     # ------------------------------------------------------------------------------ phases
     def sync_results(self) -> None:
-        new = 0
-        for pid, p in self.reg["proposals"].items():
-            root = WORKSPACE / "results" / pid
-            if not root.exists():
-                continue
-            for mf in sorted(root.glob("*/metrics.json")):
-                if not (mf.parent / "DONE").exists():
-                    continue
-                m = json.loads(mf.read_text())
-                stage = m.get("stage")
-                if stage not in ("screen", "full", "sealed") or m.get("status") == "no_sandbox":
-                    continue
-                res = p.setdefault("results", {})
-                if res.get(stage, {}).get("run_dir") != m.get("run_dir"):
-                    res[stage] = {k: m.get(k) for k in RESULT_KEYS}
-                    p["status"] = f"evaluated:{stage}" if m.get("status") == "ok" else f"failed:{stage}"
-                    new += 1
+        new = sum(refresh_results(pid, p) for pid, p in self.reg["proposals"].items())
         (WORKSPACE / "registry").mkdir(exist_ok=True)
         (WORKSPACE / "registry" / "LEADERBOARD.md").write_text(
             "# Leaderboard (best stage reached per algorithm)\n\n" + self.leaderboard_md() + "\n")
@@ -381,7 +464,8 @@ class Cycle:
                 human = "\n\n".join(human_all.values()) if (i + self.n) % 3 == 0 else ""
                 nb = read(WORKSPACE / "agents" / sid / "notebook.md")[-6000:]
                 items[pid] = prompts.proposer_prompt(slot, self.n, self.library(slot["knowledge"]), nb,
-                                                     self.history(sid), directive, "\n\n".join(shared), human)
+                                                     self.history(sid), directive, "\n\n".join(shared), human,
+                                                     scope=self.scope_text())
                 meta[pid] = {"slot": sid, "kind": "idea", "redirected": bool(directive)}
         out = self.llm.call_many("propose", self.system, items, phase_tag=self.tag("propose"))
 
@@ -555,13 +639,15 @@ class Cycle:
             rules.append(f"{pid}: " + (f"VIOLATION flagged by {len(viol)} reviewer(s)" if viol else "OK"))
             if len(viol) >= 2:
                 blocked.add(pid)
+        oos = {pid: x for pid in cands if (x := self.out_of_scope(pid))}
         specs = "\n\n".join(f"<proposal id=\"{pid}\" family=\"{self.reg['proposals'][pid]['family']}\" "
                             f"novelty=\"{self.reg['proposals'][pid].get('novelty', 0.5):.2f}\">\n"
                             f"{spec_text(pid, self.reg)[:26000]}\n</proposal>" for pid in cands)
         human = "\n\n".join(f"[{k}]\n{v}" for k, v in self.human_suggestions().items())
         early = self.n <= self.c["independence_cycles"]
         K = self.c["select_per_cycle"]
-        items = {f"M{k}": prompts.moderate_prompt(k, K, specs, registry.render(self.reg), "\n".join(rules), human, early)
+        items = {f"M{k}": prompts.moderate_prompt(k, K, specs, registry.render(self.reg), "\n".join(rules), human, early,
+                                                  scope=self.scope_text())
                  for k in range(1, self.cfg["moderators"] + 1)} if cands else {}
         out = self.llm.call_many("moderate", self.system, items, prompts.MODERATE_SCHEMA, self.tag("moderate"))
 
@@ -573,7 +659,7 @@ class Cycle:
                 borda[pid] += len(cands) - rank
             for x in r.get("ranking", []):
                 why[x["id"]].append(f"{mk}: {x['rationale']}")
-        ranked = sorted((c for c in cands if c not in blocked), key=lambda c: (-borda[c], c))
+        ranked = sorted((c for c in cands if c not in blocked and c not in oos), key=lambda c: (-borda[c], c))
         stats = registry.family_stats(self.reg)
         fam = lambda pid: self.reg["proposals"][pid]["family"]
         cap = max(1, math.ceil(self.c["max_family_share"] * K))
@@ -604,7 +690,8 @@ class Cycle:
                 reason[pid] = "selected (family cap relaxed: too few proposals in other families)"
         for pid in cands:
             reason.setdefault(pid, "blocked: rule violation flagged by two or more reviewers" if pid in blocked
-                              else "not selected this cycle (ranked below the cut)")
+                              else (f"out of this swarm's scope (uses {', '.join(oos[pid])})" if pid in oos
+                                    else "not selected this cycle (ranked below the cut)"))
         for pid in forced:
             chosen.append(pid)
             reason[pid] = "selected automatically (reference reproduction or human priority request)"
@@ -1046,8 +1133,20 @@ def costs() -> None:
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["init", "run", "loop", "status", "costs"])
+    ap.add_argument("cmd", choices=["init", "run", "loop", "status", "costs", "timing", "move", "import"])
+    ap.add_argument("bundle", nargs="?", help="import: the bundle directory written by `move`")
     ap.add_argument("--only", choices=PHASES)
+    ap.add_argument("--slow-minutes", type=float, help="timing: split proposers and families at this many minutes per run")
+    ap.add_argument("--to", help="move: the destination swarm directory")
+    ap.add_argument("--slot", action="append", default=[], help="move: a proposer to move (repeatable)")
+    ap.add_argument("--family", action="append", default=[], help="move: a family whose proposals move (repeatable)")
+    ap.add_argument("--alg", action="append", default=[], help="move: a single proposal / algorithm id (repeatable)")
+    ap.add_argument("--copy", action="store_true", help="move: copy instead (nothing changes in this swarm)")
+    ap.add_argument("--reevaluate", choices=["passed", "all", "none"], default="passed",
+                    help="move: which moved algorithms the destination evaluates again (default: those that passed "
+                         "the gate here or were not evaluated yet)")
+    ap.add_argument("--apply", action="store_true", help="move: do it (without this: a dry run)")
+    ap.add_argument("--name", help="move: name of this swarm if config/local.env has none")
     a = ap.parse_args(argv)
     if a.cmd == "init":
         return init()
@@ -1055,6 +1154,22 @@ def main(argv=None) -> None:
         return status()
     if a.cmd == "costs":
         return costs()
+    if a.cmd in ("timing", "move", "import"):
+        from . import transfer
+        if a.cmd == "timing":
+            return transfer.timing(a.slow_minutes)
+        if a.cmd == "move":
+            if not a.to:
+                ap.error("move needs --to DIR")
+            return transfer.move(a.to, a.slot, a.family, a.copy, a.reevaluate, a.apply, a.name, a.alg)
+        if not a.bundle:
+            ap.error("import needs the bundle directory")
+        return transfer.import_bundle(a.bundle)
+    with swarm_lock():
+        _run_or_loop(a)
+
+
+def _run_or_loop(a) -> None:
     try:
         if a.cmd == "run":
             Cycle().run(a.only)

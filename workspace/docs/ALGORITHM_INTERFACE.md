@@ -216,6 +216,16 @@ language that is not enabled, and it can be requested like a package. The toy se
 6. Goal: gate passed and effective RMS below 0.20 m/s, confirmed on sealed data that no
    one has developed against.
 
+Every development-data report also has a section **Residual diagnostics**, computed by
+the harness from the un-injected run: the shape of the residual distribution;
+correlations of the corrected RVs with observing conditions (barycentric correction,
+solar zenith angle and airmass, hour angle, water vapour) and with activity indicators
+(FWHM, bisector, Ca II H&K, H-alpha); the structure function and the periodicities left;
+mean and RMS per season and per year. Each is shown next to the same statistic for the
+pipeline RVs. Use them to find what structure is left in the residuals. The human
+scientists maintain this list: ask for another diagnostic with a `REQUEST TO HUMANS:`
+line in a post-mortem. Sealed reports contain none.
+
 Stages: `screen` (development data, 1 injection) -> `full` (development
 data, 2 injections) -> `sealed` (rationed). Promotion between stages follows fixed
 numerical rules.

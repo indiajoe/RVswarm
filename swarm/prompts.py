@@ -134,7 +134,7 @@ Published papers or arXiv ids for anything borrowed. "None (first principles)" i
 
 
 def proposer_prompt(slot: dict, cycle: int, library: str, notebook: str, history: str,
-                    directive: str, shared: str, human: str) -> str:
+                    directive: str, shared: str, human: str, scope: str = "") -> str:
     parts = [f"You are proposer {slot['id']}: {PERSONAS[slot['persona']]}. This is cycle {cycle}.",
              VIEWS[slot["view"]]]
     if library:
@@ -159,6 +159,9 @@ def proposer_prompt(slot: dict, cycle: int, library: str, notebook: str, history
                      "or argue against them):\n<human_suggestions>\n" + human + "\n</human_suggestions>")
     if directive:
         parts.append("Direction for this cycle from the moderators:\n" + directive)
+    if scope:
+        parts.append("Scope of this swarm, set by the human scientists (other kinds of method are pursued "
+                     "elsewhere):\n" + scope)
     parts.append(
         "Write ONE proposal for an algorithm to be implemented and evaluated this cycle. You work "
         "independently: other proposers are pursuing their own lines and you are not told what currently "
@@ -290,7 +293,7 @@ MODERATE_SCHEMA = {
 
 
 def moderate_prompt(k: int, n_select: int, specs: str, registry_md: str, critiques: str, human: str,
-                    early: bool) -> str:
+                    early: bool, scope: str = "") -> str:
     return (f"You are moderator {k} of the collaboration. {n_select} of this cycle's proposals will be handed "
             "to implementers. Rank ALL proposals from most to least worth implementing this cycle.\n\n"
             "What you are optimising is the collaboration's chance of ending with several different "
@@ -304,6 +307,8 @@ def moderate_prompt(k: int, n_select: int, specs: str, registry_md: str, critiqu
             "evaluated.\n"
             "- A proposal that responds precisely to its own earlier post-mortem deserves credit.\n"
             + ("- The collaboration is in its early, independent phase: breadth matters most.\n" if early else "")
+            + (f"- Scope of this swarm, set by the humans (a proposal outside it is not selected whatever "
+               f"its rank): {scope}\n" if scope else "")
             + "\nA fixed rule applied after you will cap any one family's share of the selection and reserve "
             "places for novel ideas in untried families, so rank on merit within those principles.\n\n"
             "Also give: a short comment on the health of the portfolio; a response to each human suggestion "
@@ -537,7 +542,9 @@ def postmortem_prompt(slot: dict | None, pid: str, spec: str, notes: str, report
             "Cover, in under 700 words:\n"
             "1. **Outcome versus prediction** -- the pre-registered numbers next to the measured ones.\n"
             "2. **What the evidence says about the mechanism** -- use the timescale table, the per-band "
-            "transfers and your diagnostics. Distinguish 'the idea is wrong', 'the idea is right but too "
+            "transfers, your own diagnostics and the harness's residual diagnostics (distribution shape, "
+            "correlations with observing conditions and activity indicators, structure function and "
+            "periodicities, seasons and years). Distinguish 'the idea is wrong', 'the idea is right but too "
             "weak', 'the implementation or data handling let it down' and 'cannot tell'; say what would tell.\n"
             "3. **What limits it now** -- the largest remaining term in the residual scatter, as specifically "
             "as the evidence allows.\n"

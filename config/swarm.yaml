@@ -91,7 +91,9 @@ cycle:
   max_postmortems_per_cycle: 16
   submit_command: ""             # e.g. "bin/submit_eval.sh" if this host has sbatch, or an ssh command
 
-# The proposer panel.  persona = specialist role, knowledge = which slice of the
+# The proposer panel. (Once config/local_swarm.yaml has a proposer_slots list -- written by
+# `bin/swarm.sh move` -- that list is used instead. RUNBOOK section 3.6.)
+# persona = specialist role, knowledge = which slice of the
 # literature library the agent is given (none = first principles only),
 # view = the data product it is asked to think from first.
 proposer_slots:
@@ -121,6 +123,15 @@ proposer_slots:
   - {id: P22, persona: signal_outsider,        knowledge: B,    view: time_series}
   - {id: P23, persona: bayesian_statistician,  knowledge: none, view: ccf_and_indices}
   - {id: P24, persona: bayesian_statistician,  knowledge: full, view: spectra}
+
+# What THIS swarm works on. Empty = unrestricted. Set it per swarm in config/local_swarm.yaml,
+# for example to run one fast swarm on the compact data products and one slow swarm on the
+# full spectra (RUNBOOK section 3.6). The note is shown to proposers and moderators;
+# allowed_uses is enforced: a proposal whose `uses` front matter lists anything else is not
+# selected (reference reproductions and human priority requests are exempt).
+scope:
+  note: ""
+  allowed_uses: []           # from: spectra, ccf, order_rv, indices, telemetry, time
 
 skeptics: [skeptic_statistics, skeptic_physics, skeptic_instrument]
 moderators: 2

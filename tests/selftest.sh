@@ -25,5 +25,9 @@ res=$(RVSWARM_ALLOW_UNSANDBOXED=1 RVSWARM_TEST_BACKEND='{"kind": "synth", "seed"
       "$PY" -m harness.evaluate --alg-dir tests/algs/no_gain --stage screen --out-root "$OUT/no_gain" | tail -1)
 if [ -f "$OUT/no_gain/screen_01/metrics.json" ] && grep -q '"injection_skipped": true' "$OUT/no_gain/screen_01/metrics.json"; then
   echo "ok    precheck_skips_injection"; else echo "FAIL  precheck_skips_injection :: $res"; fail=1; fi
+mkdir -p "$OUT"
+# residual diagnostics: every file in harness/residual_diagnostics/ runs and respects the limits
+if "$PY" -m harness.residual_diagnostics check > "$OUT/residual_diagnostics.txt" 2>&1; then
+  echo "ok    residual_diagnostics"; else echo "FAIL  residual_diagnostics (see: bin/py.sh -m harness.residual_diagnostics check)"; fail=1; fi
 rm -rf "$OUT"
 [ $fail = 0 ] && echo "ALL SELF-TESTS PASSED" || { echo "SELF-TEST FAILURES"; exit 1; }

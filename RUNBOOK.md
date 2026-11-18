@@ -68,14 +68,16 @@ a result directory (`workspace/results/<id>/<stage>_NN/`).
 | `config/swarm.yaml` | models, agent roster, cycle shape, budget | you |
 | `config/cluster.env` | data path on compute nodes, Python, SLURM account/partitions | you |
 | `harness/` | ingest, data API, injection, audit, runner, scoring, promotion | fixed code |
+| `harness/residual_diagnostics/` | the residual diagnostics printed in every development-data report, one file each (section 9) | **you** |
 | `bin/submit_eval.sh` | the dumb bash script that submits evaluation jobs | fixed code |
 | `bin/submit_ingest.sh` | builds the compact data store with a SLURM array | fixed code |
 | `bin/swarm.sh`, `bin/py.sh` | run the orchestrator / any project Python command with this swarm's environment loaded | fixed code |
 | `bin/new_swarm.sh` | creates one independent swarm (section 3.5) | fixed code |
 | `config/local.env` | this swarm's name and data directories (not in git) | `bin/new_swarm.sh`, you |
+| `config/local_swarm.yaml` | this swarm's own settings: its panel after a move, its scope, its pace (not in git; overrides `swarm.yaml`) | `bin/swarm.sh move`, you |
 | `config/trial.yaml` | overlay for the short capped trial run (section 6.0) | you |
 | `baselines/` | 3 reference algorithms + 3 canary cheaters | fixed code |
-| `swarm/` | orchestrator: `cycle.py`, `llm.py`, `prompts.py`, `registry.py`, `tools.py` | fixed code |
+| `swarm/` | orchestrator: `cycle.py`, `llm.py`, `prompts.py`, `registry.py`, `tools.py`; `transfer.py` (timing, moving between swarms) | fixed code |
 | `workspace/docs/` | problem brief, data description, algorithm interface (what agents are told) | you |
 | `workspace/literature/` | method cards with citations | librarian agent |
 | `workspace/proposals/cNNN/<id>/` | `PROPOSAL.md`, per round `CRITIQUE_rN_<skeptic>.md` and `DRAFT_rN.md`, final `SPEC.md`; `../DEBATE_SUMMARY.md` | proposers, skeptics |
@@ -90,7 +92,7 @@ a result directory (`workspace/results/<id>/<stage>_NN/`).
 | `workspace/human_suggestions/` | your steering notes | **you** |
 | `workspace/diagnostic_requests/` | agents' requests for harness changes | agents → you |
 | `workspace/agents/<slot>/notebook.md` | each proposer's private notes to its future self | proposers |
-| `state/` | cycle state, spending ledger, tickets, SLURM logs, injection truth | orchestrator, harness |
+| `state/` | cycle state, spending ledger, tickets, SLURM logs, injection truth; `TIMING.md`, `moved/` and `moves.log` (moves between swarms), `sealed_diagnostics/` | orchestrator, harness |
 | `secrets/harness_secret.key` | seeds the hidden planets (auto-created, mode 600) | harness |
 
 ## 3. One-time setup
@@ -228,10 +230,94 @@ for s in A B C; do echo "== swarm $s"; (cd ../rvswarm_$s && bin/swarm.sh status 
 
 The cross-swarm comparison is the final scientific product: which method families
 reach the target in more than one swarm, and whether an algorithm from swarm A also
-works on the data of swarm B. The second test is yours to run by hand at the end, by
-copying the algorithm directory into another swarm and queueing it with
-`bin/py.sh -m harness.promote enqueue --alg <id>`; do it only after that swarm has
-finished, since it breaks the separation.
+works on the data of swarm B. The second test is yours to run at the end, with
+`bin/swarm.sh move --to ../rvswarm_B --alg <id> --copy --reevaluate all --apply`
+(section 3.6); do it only after swarm B has finished, since it breaks the separation.
+
+### 3.6 Fast and slow swarms: CPU time, and moving proposers or families
+
+After a few cycles you may want to sort the work by speed. Methods built on the CCFs,
+per-order RVs and indices run in minutes; methods that read every spectrum can take
+hours. A swarm of fast methods can then cycle quickly, and the slow methods go to a swarm
+that cycles at its own pace.
+
+**1. See where the CPU time goes.** In each swarm:
+
+```bash
+bin/swarm.sh timing                       # tables; also written to state/TIMING.md
+bin/swarm.sh timing --slow-minutes 30     # plus a split at 30 min per run and the commands for it
+```
+
+It ranks algorithms, proposers and families by the wall time of one un-injected run (at
+the screen stage that is the same work for every algorithm), with the core-hours
+reserved (what the allocation is charged: CPUs requested x wall time) and used over all
+stages, the data products each method declared in `uses`, and each group's share of the
+swarm's CPU time. Evaluations from before 2026-11-18 have no per-run timing; their
+duration is estimated from the start and end times.
+
+**2. Move proposers or families.** Stop the loops of both swarms between cycles (the
+command refuses while one runs or a cycle is half done). Then, in the swarm that gives
+them away:
+
+```bash
+bin/swarm.sh move --to ../rvswarm_B --slot P05 --slot P12            # dry run: prints the plan
+bin/swarm.sh move --to ../rvswarm_B --slot P05 --slot P12 --apply    # does it
+bin/swarm.sh move --to ../rvswarm_B --family F05 --apply             # every proposal of a family
+bin/swarm.sh move --to ../rvswarm_B --alg c004_P09 --apply           # single proposals
+```
+
+* `--slot` moves a proposer: its place in the panel, its notebook, and all of its
+  proposals with their debates, specifications, code, reviews and post-mortems. It goes
+  on in the destination as `P05A` (old id plus the source swarm's name), continuing from
+  its own history.
+* `--family` moves every proposal of the family, whoever proposed it. Their proposers
+  stay unless you also name them with `--slot`; the destination's reference specialist
+  then writes the post-mortems of those algorithms. Reference reproductions stay (every
+  swarm has its own).
+* Ids change because every swarm has its own P01...P24 and c001_P01...: proposal
+  `c003_P05` of swarm A becomes `A_c003_P05` in B. Mentions inside the moved documents are
+  rewritten; mentions of what stayed behind become `A:c002_P07`. Families keep their id
+  when B has the same family under the same name, otherwise they are added to B's registry.
+* **Results do not move as results.** The destination evaluates the code again on its
+  own data and hidden planets. `--reevaluate passed` (the default) queues the algorithms
+  that passed the gate in the source or were not evaluated yet; `all` and `none` are the
+  alternatives. The source's results stay visible to the proposer as history, labelled as
+  measured on a different curated set.
+* In the source, the moved code leaves `workspace/algorithms/` (so it is no longer
+  evaluated there), queued evaluations are cancelled, the proposers leave the panel, and
+  the registry marks the proposals as moved. Everything moved is also kept in
+  `state/moved/<date>_move_to_B/`, with the id map in `IMPORTED.json`; `state/moves.log`
+  lists every move.
+* `--copy` imports into the destination and changes nothing in the source.
+
+After the first move the panel of each swarm lives in `config/local_swarm.yaml` (not in
+git), which overrides `proposer_slots` of `config/swarm.yaml`; edit the panel there from
+then on. Do not run a move with `RVSWARM_SWARM_OVERLAY` pointing at the trial overlay in
+the shell where you later run the loop: the trial overlay replaces the panel.
+
+**3. Keep each swarm to its kind of method.** Otherwise the fast swarm's proposers soon
+propose slow methods again. In the fast swarm's `config/local_swarm.yaml`:
+
+```yaml
+scope:
+  note: "This swarm develops fast methods built on the CCFs, per-order RVs, activity
+    indices and telemetry. Methods that read the full spectra are developed in another swarm."
+  allowed_uses: [ccf, order_rv, indices, telemetry, time]
+cycle:
+  wait_for_results: screen
+```
+
+The note is shown to proposers and moderators. `allowed_uses` is enforced at selection: a
+proposal whose `uses` front matter lists anything else (`spectra`) is not selected, with
+that reason in `SELECTION.md`; reference reproductions and your `PRIORITY_` requests are
+exempt. It relies on the proposal declaring its inputs honestly; `bin/swarm.sh timing`
+shows whether it did. The slow swarm gets a note of its own and usually no
+`allowed_uses`.
+
+**The price in independence.** A moved proposer brings what it learnt on the source
+swarm's data. After a move the two swarms are no longer independent replications of that
+line of work (an untouched third swarm still is). Keep `state/moves.log` in mind when you
+compare the swarms at the end.
 
 ## 4. Build the data store
 
@@ -631,7 +717,27 @@ audit. Agents cannot read that directory.
 * **Force an idea into the next cycle**: name the file `PRIORITY_my_idea.md`. It is
   turned into a full specification, reviewed, implemented and evaluated outside the
   10-idea quota.
-* **Add a diagnostic**: read `workspace/diagnostic_requests/`.
+* **Give the agents more statistics of their residuals.** Every development-data report
+  has a section "Residual diagnostics": tables computed by the harness from the
+  un-injected run that show the structure of the corrected RVs without the RVs
+  themselves. Built in: distribution shape (skewness, kurtosis, outliers,
+  autocorrelation); correlation with the barycentric correction, solar zenith angle and
+  airmass, hour angle, water vapour, FWHM, bisector, Ca II H&K and H-alpha; the structure
+  function and remaining periodicities; mean and RMS per season and per year. Each
+  statistic is shown next to the same one for the pipeline RVs. Each diagnostic is one
+  small Python file in `harness/residual_diagnostics/`. To add one, copy `_template.py`
+  there to a new name, fill in `TITLE`, `ABOUT` and `compute(ep)`, and run
+  `bin/py.sh -m harness.residual_diagnostics check`: it runs every diagnostic on the
+  synthetic Sun and prints the section exactly as the agents will see it, or the error.
+  Commit it; each swarm picks it up with `git pull`. The harness enforces the rules:
+  tables only, at most `residual_diagnostics.max_numbers` (60) numbers per diagnostic,
+  rounded to 3 significant digits, and nothing in sealed reports (for sealed runs the
+  tables go to `state/sealed_diagnostics/`, for you). A failing diagnostic is reported as
+  not available and the evaluation goes on. Switch one off with
+  `residual_diagnostics.disabled` in `config/harness.yaml`. The agents' own requests for
+  diagnostics collect in `workspace/diagnostic_requests/`. (Separately, an algorithm's
+  own logs and `ctx.diagnostic` arrays from development runs are published by design,
+  so an algorithm can print development-data values; sealed reports show neither.)
 * **Add a package the agents asked for**: read `workspace/environment_requests/PENDING.md`.
   A proposal lists what it needs under `requires:`; if selected, it waits there instead
   of being implemented. Install the package in the cluster environment, in the sandbox
@@ -653,8 +759,10 @@ audit. Agents cannot read that directory.
   real barrier. Only the C route has been tested (no Fortran or Julia here).
 * **Tell the agents something about the data**: edit
   `workspace/docs/DATA_DESCRIPTION.md`. Every agent reads it every cycle.
-* **Change the panel**: edit `proposer_slots` (add, remove, re-role). A slot's history
-  and notebook follow its `id`.
+* **Change the panel**: edit `proposer_slots` (add, remove, re-role) in
+  `config/swarm.yaml`, or in `config/local_swarm.yaml` once that file has one (after a
+  move between swarms, section 3.6). A slot's history and notebook follow its `id`.
+* **Narrow a swarm to one kind of method, or move work to another swarm**: section 3.6.
 * **Change how long proposals are debated**: `cycle.debate_rounds`. Each round, the three
   skeptics review the current draft (from round 2 on they see their own previous review and
   the proposer's response, and are told to raise only unresolved or new points), then the
@@ -910,6 +1018,8 @@ What to do with these numbers:
 | ticket stuck in `state/eval_submitted/` | the SLURM job died without reporting. After job time + 3 days it is closed automatically as `job_lost`; to retry sooner, move the file back to `state/eval_queue/` |
 | result `status: audit_failed` | the report lists the offending lines; the proposer sees it in the post-mortem phase |
 | result `status: run_failed` | traceback is in the report; SLURM log in `state/slurm_logs/` |
+| `Another orchestrator process is working on this swarm` | a `loop`, `run` or `move` is running in this swarm (its pid is in `state/orchestrator.lock`): stop it first. The lock is released when the process ends, so a leftover file is harmless |
+| `move` refuses: `in the middle of cycle N` | let the cycle finish (`bin/swarm.sh run`), then move |
 | result has `injection_skipped: true` | the pre-check found no reduction of the pipeline scatter, so no planets were injected (section 10.1). Not an error |
 | many `implementation_failed` | read `workspace/algorithms/<id>/REVIEW.md`; specs may be too ambitious for the turn limit -- raise `implement_max_turns` |
 | algorithm needs a package | add to `audit.allowed_imports`, install on the cluster and orchestrator, document in `ALGORITHM_INTERFACE.md` |
@@ -937,6 +1047,10 @@ Tested here:
   screen stage; baselines still get theirs (`tests/selftest.sh`, 10 checks).
 * The numerical analyst, the performance engineer, the optimisation pass and the
   restoring of the reviewed code when the optimised code fails review, with mock replies.
+* The residual diagnostics on the synthetic Sun (screen, pre-check and sealed reports).
+* `bin/swarm.sh timing` and `move` (dry run, `--slot`, `--family`, `--alg`, `--copy`) between
+  two swarm copies with mock replies and local evaluations on the synthetic Sun, followed
+  by a further mock cycle in each; the lock against two orchestrators; the `scope` rule.
 * The whole orchestration (all phases, two consecutive cycles) with mock model replies.
 
 Not tested here, because this container has no API key, no `sbatch` and only 16

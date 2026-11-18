@@ -28,7 +28,19 @@ git clone --quiet "$HERE" "$DEST"
   echo "export NEID_DATA_DIR=\"$DATA\""
   echo "export RVSWARM_TOY_DATA_DIR=\"$TOY\""
 } > "$DEST/config/local.env"
-if [ -d "$HERE/.venv" ]; then ln -s "$HERE/.venv" "$DEST/.venv"; fi      # share the Python environment
+cat > "$DEST/config/local_swarm.yaml" <<EOT
+# Settings of swarm $NAME that differ from config/swarm.yaml. Not tracked by git.
+# Keys here replace those in swarm.yaml; a list replaces the whole list. RUNBOOK section 3.6.
+# Examples (remove the leading '# ' to use):
+# scope:
+#   note: "This swarm develops fast methods built on the CCFs, per-order RVs, indices and telemetry."
+#   allowed_uses: [ccf, order_rv, indices, telemetry, time]
+# cycle:
+#   wait_for_results: screen
+EOT
+if [ -d "$HERE/.venv" ] && [ ! -e "$DEST/.venv" ] && [ ! -L "$DEST/.venv" ]; then
+  ln -s "$HERE/.venv" "$DEST/.venv"                                      # share the Python environment
+fi
 echo "swarm $NAME created in $DEST"
 echo "  data: $DATA"
 echo "next, inside $DEST: follow RUNBOOK section 3.5"

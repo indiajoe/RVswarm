@@ -1,4 +1,4 @@
-.venv/
+.venv
 __pycache__/
 *.pyc
 secrets/
@@ -6,3 +6,4 @@ data_store/
 state/
 config/local.env
 *.swp
+config/local_swarm.yaml

@@ -69,6 +69,17 @@ precheck:
   stages: [screen]
   max_rms_ratio: 0.95
 
+# Reduced statistics of the corrected RVs printed in every development-data report (never for
+# sealed data): distribution shape, correlation with observing conditions and indicators,
+# timescales, seasons and years. One file per diagnostic in harness/residual_diagnostics/;
+# add one by copying _template.py there, then test with
+#     bin/py.sh -m harness.residual_diagnostics check
+residual_diagnostics:
+  enabled: true
+  disabled: []               # file names (without .py) to skip, e.g. [seasons]
+  max_numbers: 60            # numbers one diagnostic may publish; the rest is cut off
+  significant_digits: 3      # floats are rounded to this many significant digits
+
 promotion:                       # applied by harness/promote.py -- no agent input
   screen_to_full_max_ratio: 0.95       # effective_rms / raw_rms must be below this
   full_to_sealed_max_ratio: 0.60

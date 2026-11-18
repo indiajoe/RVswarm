@@ -24,10 +24,18 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from string import Template
 
+if __name__ == "__main__":
+    # The harness's own numerics (scoring, residual diagnostics) take well under a second.
+    # Keep this process's BLAS single-threaded: threads gain nothing here, and a threaded
+    # OpenBLAS was seen to spin for good on an oversubscribed host. Algorithm runs get
+    # their own thread counts in run_one().
+    for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ[_v] = "1"
+
 import numpy as np
 import yaml
 
-from . import audit, backends, config, injection, score
+from . import audit, backends, config, injection, residual_diagnostics, score
 
 # sparse like the curated real set: about one epoch every three days
 TOY_BACKEND = {"kind": "synth", "seed": 3, "n_days": 900, "obs_per_day": 1, "day_keep": 0.33}
@@ -176,6 +184,8 @@ def write_report(out: Path, alg_id: str, stage: str, m: dict, man: dict, runs: l
               f"| 1 day | {m['rms_raw_daily']:.4f} | {m['rms_null_daily']:.4f} |"]
         for n in ("2", "4", "8", "16", "32"):
             L.append(f"| {n} days | {m['rms_raw_multiday'][n]:.4f} | {m['rms_null_multiday'][n]:.4f} |")
+    if m.get("residual_diagnostics"):
+        L += ["", residual_diagnostics.to_markdown(m["residual_diagnostics"])]
     L += ["", "## Run facts", "",
           f"- resources: {man['resources']}",
           "- wall time per run (s): " + ", ".join(f"{r['runtime_s']:.0f}" for r in runs),
@@ -291,6 +301,11 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
         backend_spec = backend_spec or TOY_BACKEND
         stage_cfg = {"n_injections": 1}
         hours = min(res["hours"], 0.5)
+        # Several implementers test at once on the orchestrator host: give each run a share
+        # of its cores (RVSWARM_TOY_CPUS, set by the orchestrator), not what the cluster grants.
+        share = os.environ.get("RVSWARM_TOY_CPUS", "").strip()
+        if share.isdigit() and int(share) >= 1:
+            res = dict(res, cpus=min(res["cpus"], int(share)))
     else:
         test = os.environ.get("RVSWARM_TEST_BACKEND")          # plumbing tests only (see RUNBOOK)
         backend_spec = backend_spec or (json.loads(test) if test else
@@ -368,6 +383,9 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
         with ThreadPoolExecutor(max_workers=par) as ex:
             runs += list(ex.map(lambda r: go(r, max(1, res["cpus"] // par)), range(1, n_runs)))
     cpu_s, wall_s = cpu_seconds() - cpu0, time.time() - wall0
+    meta["runtimes_s"] = [round(r["runtime_s"], 1) for r in runs]        # run 0 = un-injected
+    meta["n_obs_input"] = int(index.size)
+    meta["resources"] = res
     meta["cpu_core_hours"] = cpu_s / 3600
     meta["wall_hours"] = wall_s / 3600
     meta["cpu_utilisation"] = cpu_s / max(wall_s * res["cpus"], 1e-9)
@@ -376,10 +394,28 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
     (truth_dir / f"{out.name}.json").write_text(json.dumps(
         {"tags": tags, "planets": [p["planets"] for p in plans], "t0": t0}, indent=1))
 
+    # Residual diagnostics (harness/residual_diagnostics/): reduced statistics of the un-injected
+    # run. Published for development data only; for sealed runs kept in state/ for the humans.
+    # Not for the local toy test: it would only add tokens to every implementer's test report.
+    rd = None
+    if runs[0]["status"] == "ok" and stage != "toy" and (cfg.get("residual_diagnostics") or {}).get("enabled", True):
+        try:
+            ep = residual_diagnostics.Epochs(be, index, runs[0]["rv_clean"], score_days,
+                                             cfg["data"]["min_obs_per_day"])
+            rd = residual_diagnostics.run_all(ep, cfg)
+        except Exception as e:                                   # never let a diagnostic stop a result
+            rd = [{"name": "harness", "title": "Residual diagnostics",
+                   "error": f"not available (harness error: {type(e).__name__})"}]
+        if not publish:
+            keep = config.STATE / "sealed_diagnostics" / alg_id
+            keep.mkdir(parents=True, exist_ok=True)
+            (keep / f"{out.name}.md").write_text(residual_diagnostics.to_markdown(rd))
+            rd = None
     if runs[0]["status"] != "ok":
         result = finish({"status": "run_failed", "error": runs[0]["error"], "gate_pass": False})
     elif skipped is not None:
         skipped["algorithm_metrics"] = runs[0]["metrics"] if publish else {}
+        skipped["residual_diagnostics"] = rd
         if publish and runs[0]["diags"]:
             np.savez_compressed(out / "diagnostics.npz", **runs[0]["diags"])
         result = finish(skipped)
@@ -412,6 +448,7 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
         if publish and runs[0]["diags"]:
             np.savez_compressed(out / "diagnostics.npz", **runs[0]["diags"])
         m["algorithm_metrics"] = runs[0]["metrics"] if publish else {}
+        m["residual_diagnostics"] = rd
         result = finish(m)
     if not keep_scratch:
         shutil.rmtree(work, ignore_errors=True)
