@@ -11,7 +11,8 @@ import yaml
 
 ROOT = Path(os.environ.get("RVSWARM_ROOT") or Path(__file__).resolve().parents[1])
 WORKSPACE = ROOT / "workspace"          # the only tree agents can read / write
-STATE = ROOT / "state"                  # orchestrator + harness bookkeeping
+# orchestrator + harness bookkeeping; RVSWARM_STATE_DIR is for self-tests only (tests/selftest.sh)
+STATE = Path(os.environ.get("RVSWARM_STATE_DIR") or ROOT / "state")
 QUEUE = STATE / "eval_queue"            # tickets waiting for bin/submit_eval.sh
 SECRET_FILE = ROOT / "secrets" / "harness_secret.key"
 

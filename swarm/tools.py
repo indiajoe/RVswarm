@@ -21,9 +21,12 @@ class Toolset:
     """read_roots / write_roots are directories relative to workspace/."""
 
     def __init__(self, read_roots: list[str], write_roots: list[str], alg_dir: Path | None = None,
-                 allow_tests: bool = False):
+                 allow_tests: bool = False, read_only: dict[str, str] | None = None):
+        """read_only: {path relative to workspace/: reason} -- readable, never writable, even inside
+        a write root (e.g. a reduction step reused unchanged from another algorithm)."""
         self.read_roots = [(WORKSPACE / r).resolve() for r in read_roots + write_roots]
         self.write_roots = [(WORKSPACE / r).resolve() for r in write_roots]
+        self.read_only = {(WORKSPACE / r).resolve(): why for r, why in (read_only or {}).items()}
         self.alg_dir = alg_dir
         self.allow_tests = allow_tests
         self.tests_run = 0
@@ -64,6 +67,9 @@ class Toolset:
         if not any(p == r or r in p.parents for r in roots):
             allowed = ", ".join(str(r.relative_to(WORKSPACE)) for r in roots)
             raise PermissionError(f"'{path}' is outside what you may {'write' if write else 'read'}: {allowed}")
+        for r, why in self.read_only.items():
+            if write and (p == r or r in p.parents):
+                raise PermissionError(f"'{path}' is read-only: {why}")
         return p
 
     def execute(self, name: str, args: dict) -> tuple[str, bool]:

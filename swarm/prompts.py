@@ -85,6 +85,7 @@ title: <short descriptive title>
 family_hint: <one phrase naming the kind of approach>
 parents: []            # ids of earlier algorithms this builds on, if any
 uses: [ccf]            # any of: spectra, ccf, order_rv, indices, telemetry, time
+reduction: none        # none | new | reuse <algorithm id>   -- see section 3a
 resources: {cpus: 8, mem_gb: 64, gpus: 0, hours: 4}
 language: python       # python is preferred; add c / cpp / fortran / julia only for a core that is
                        # significantly too slow in NumPy / Numba / JAX / PyTorch
@@ -117,6 +118,21 @@ the method to fit the default environment. Python is the preferred language: ask
 C++, Fortran or Julia only when Python (NumPy, Numba, JAX, PyTorch) would be significantly slower, \
 and say why.
 
+## 3a. Preliminary reduction
+Write "None" if `reduction: none`. A preliminary reduction step turns the data into intermediate \
+products that depend on the data alone, not on your correction model: for example line-by-line \
+RVs with their errors, per-line shape measurements, a stack of residual spectra. It runs as a \
+separate step before the algorithm. Its products on the un-injected data are computed once and \
+cached by the harness, and every later algorithm with the same reduction step reuses them; runs \
+with hidden planets always recompute it. So an expensive first step that later work can build on \
+belongs here, and reusing an existing one makes an evaluation much cheaper.
+- `reduction: new` -- specify the step here: inputs, every operation, and the exact products it \
+returns (name, shape, units, meaning). Make the products general enough for later proposals.
+- `reduction: reuse <id>` -- the reduction step of algorithm `<id>`, from the list of available \
+reductions you were given, is used exactly as it is: its code is copied unchanged, and nobody \
+re-implements or modifies it. Name the products you use; section 3 starts from them. If you need \
+it changed in any way, that is a `new` reduction: specify it in full.
+
 ## 4. Why planets survive
 The argument that a pure Doppler shift of the whole spectrum passes through with unit gain at \
 periods from 2 to 400 days, and where that argument is weakest.
@@ -134,7 +150,7 @@ Published papers or arXiv ids for anything borrowed. "None (first principles)" i
 
 
 def proposer_prompt(slot: dict, cycle: int, library: str, notebook: str, history: str,
-                    directive: str, shared: str, human: str, scope: str = "") -> str:
+                    directive: str, shared: str, human: str, scope: str = "", reductions: str = "") -> str:
     parts = [f"You are proposer {slot['id']}: {PERSONAS[slot['persona']]}. This is cycle {cycle}.",
              VIEWS[slot["view"]]]
     if library:
@@ -162,6 +178,11 @@ def proposer_prompt(slot: dict, cycle: int, library: str, notebook: str, history
     if scope:
         parts.append("Scope of this swarm, set by the human scientists (other kinds of method are pursued "
                      "elsewhere):\n" + scope)
+    if reductions:
+        parts.append("Preliminary reduction steps available for reuse (`reduction: reuse <id>` in the front "
+                     "matter; see section 3a of the template). Their products on the un-injected data are already "
+                     "cached, so reusing one saves CPU time in every evaluation; reuse one only if its products "
+                     "are what your method needs.\n<reductions>\n" + reductions + "\n</reductions>")
     parts.append(
         "Write ONE proposal for an algorithm to be implemented and evaluated this cycle. You work "
         "independently: other proposers are pursuing their own lines and you are not told what currently "
@@ -318,11 +339,30 @@ def moderate_prompt(k: int, n_select: int, specs: str, registry_md: str, critiqu
             f"<proposals>\n{specs}\n</proposals>\n\n<reviewer_rule_checks>\n{critiques}\n</reviewer_rule_checks>")
 
 
-def implement_prompt(alg_id: str, parents: list[str]) -> str:
+def implement_prompt(alg_id: str, parents: list[str], reduction: tuple = ("none", None)) -> str:
     extra = ""
     if parents:
         extra = ("The specification builds on earlier algorithms whose code you may read for reuse: "
                  + ", ".join(f"`algorithms/{p}/`" for p in parents) + ".\n")
+    mode, src = reduction
+    if mode == "reuse":
+        red = (f"- The specification REUSES the preliminary reduction step of `{src}` (its front matter says "
+               f"`reduction: reuse {src}`). That code is already in `algorithms/{alg_id}/reduction/`, copied "
+               "unchanged, and is read-only for you: do not re-implement, copy or modify it, and do not compute "
+               "its products again. Read `reduction/reduce.py` for what it returns (and "
+               f"`algorithms/{src}/algorithm.py` for how they were used there), and start `run(ctx)` from "
+               "`ctx.reduction()` (interface section 2a). Its products on the un-injected data are cached.\n")
+    elif mode == "new":
+        red = (f"- The specification has a NEW preliminary reduction step (its section 3a). Put it in "
+               f"`algorithms/{alg_id}/reduction/reduce.py` as `reduce(ctx)` returning a dict of numeric arrays, "
+               "with a module docstring that lists every product (name, shape, units, meaning); helpers go in "
+               "`reduction/` too (`algorithm.py` cannot import them). It must depend on the data alone: nothing "
+               "of the correction model, no `ctx.metric` / `ctx.diagnostic`, deterministic. `run(ctx)` starts "
+               "from `ctx.reduction()` (interface section 2a). Later algorithms may reuse the step unchanged, "
+               "so keep it clean and its products general.\n")
+    else:
+        red = ("- The specification has no preliminary reduction step (`reduction: none`): do not create "
+               "`reduction/`.\n")
     return (f"You are an implementer in the collaboration. Implement the algorithm specified in "
             f"`algorithms/{alg_id}/SPEC.md` so that it can be evaluated on the cluster.\n\n"
             f"Your writable directory is `algorithms/{alg_id}/`. You can read `docs/`, `literature/` and the "
@@ -335,6 +375,7 @@ def implement_prompt(alg_id: str, parents: list[str]) -> str:
             "C, C++, Fortran or Julia sources in `native/` and call them from `algorithm.py` (interface "
             "section 5a), and record the reason in the notes;\n"
             "- `algorithm.yaml` with name, family and the resource request from the specification;\n"
+            + red +
             "- `IMPLEMENTATION_NOTES.md`: what you built, every deviation from the specification with the "
             "reason, known weaknesses, and anything the proposer should know when reading results.\n\n"
             "What matters:\n"
@@ -388,9 +429,14 @@ def review_prompt(alg_id: str, spec: str, files: str, toy_report: str) -> str:
             "the real data.\n\n"
             "Check, in this order:\n"
             "1. Integrity: nothing that reaches outside the data API, uses external information, hard-codes "
-            "epochs, behaves differently depending on guesses about injection, or exists to game the score.\n"
+            "epochs, behaves differently depending on guesses about injection, tries to pass anything from one "
+            "run to another, or exists to game the score. A preliminary reduction step (`reduction/`, if the "
+            "specification declares `reduction: new`) must depend on the data alone.\n"
             "2. Fidelity: each numbered step of the specification is implemented as written; deviations are "
-            "listed in the notes and justified; requested diagnostics are emitted.\n"
+            "listed in the notes and justified; requested diagnostics are emitted. The specification's "
+            "`reduction` front matter is followed: `reuse <id>` means `run(ctx)` starts from `ctx.reduction()` "
+            "and does not recompute that step (the reused code itself is not under review); `new` means the step "
+            "is in `reduction/reduce.py` with its products documented; `none` means no `reduction/`.\n"
             "3. Correctness: units (m/s vs km/s), sign conventions, array alignment with `ds.obs_id`, NaN "
             "handling, behaviour both with about 5 and with a couple of thousand observations. Indices: every "
             "index in the project documents is 0-based; check each order, pixel and velocity index against "
@@ -475,10 +521,14 @@ PERFORMANCE_SCHEMA = {
 def performance_prompt(alg_id: str, spec: str, files: str, toy_report: str) -> str:
     return (f"You are the performance engineer of the collaboration, consulted before algorithm `{alg_id}` "
             "is run on the cluster. The code has passed review for correctness. The cluster is short of "
-            "CPU time, and every evaluation runs this code two or three times on a few hundred to a couple "
-            "of thousand spectra (122 orders x 9216 pixels, about 30 MB and 0.1-0.3 s to read each), so "
-            "wasted CPU time delays every other algorithm. Find what would cut the CPU time of this code, "
-            "and check that it asks for no more than it can use.\n\n"
+            "CPU time: a screen evaluation runs this code twice (without and with hidden planets) and a full "
+            "evaluation twice more, on a few hundred to a couple of thousand spectra (122 orders x 9216 "
+            "pixels, about 30 MB and 0.1-0.3 s to read each), so wasted CPU time delays every other "
+            "algorithm. Find what would cut the CPU time of this code, and check that it asks for no more "
+            "than it can use. If the code has a preliminary reduction step (`reduction/`), its products on "
+            "the un-injected data are cached and shared, but every run with hidden planets recomputes it; "
+            "optimise it like the rest, but do not move work between `reduce(ctx)` and `run(ctx)`: the "
+            "proposer decided that split, and a reused reduction step must stay unchanged.\n\n"
             "Look for:\n"
             "1. Reading. Spectra read more than once, or whole spectra read where a few orders are used; "
             "features recomputed in a second pass instead of cached in memory or with `ctx.scratch_file`.\n"

@@ -1,7 +1,10 @@
-"""Run ONE algorithm on ONE data view inside its own process.
+"""Run ONE step of an algorithm on ONE data view inside its own process.
 
-Invoked only by harness.evaluate. Builds the (possibly injected) dataset, calls
-`algorithm.run(ctx)`, validates the output and writes it to --out.
+Invoked only by harness.evaluate, once per process directory. Builds the (possibly injected)
+dataset, then either
+  --mode run      calls `algorithm.run(ctx)`, validates the output and writes it to --out, or
+  --mode reduce   calls `reduce(ctx)` of the algorithm's reduction/ step and writes its products,
+                  one .npy file per array, to --products (the harness checks and caches them).
 """
 from __future__ import annotations
 
@@ -10,6 +13,7 @@ import ctypes
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -23,10 +27,11 @@ from .dataset import SolarDataset
 
 
 class Context:
-    """Passed to `run(ctx)`. See workspace/docs/ALGORITHM_INTERFACE.md."""
+    """Passed to `run(ctx)`, and to `reduce(ctx)` of a reduction step. See workspace/docs/ALGORITHM_INTERFACE.md."""
 
     def __init__(self, target, scratch: Path, n_cpus: int, gpu: bool, time_budget_s: float,
-                 seed: int, max_diag_bytes: int, alg_dir: Path | None = None):
+                 seed: int, max_diag_bytes: int, alg_dir: Path | None = None,
+                 products: Path | None = None, reduce_step: bool = False):
         self.target = target
         self.n_cpus = n_cpus
         self.gpu = gpu
@@ -47,10 +52,15 @@ class Context:
 
         def metric(name: str, value) -> None:
             """Record a scalar intermediate check; shown in the result report."""
+            if reduce_step:
+                raise RuntimeError("ctx.metric is not available in reduce(ctx): the products of a reduction "
+                                   "step are cached and shared; report checks from run(ctx)")
             metrics[str(name)[:80]] = float(value)
 
         def diagnostic(name: str, array) -> None:
             """Record a small array (e.g. a periodogram, PCA spectrum) for the result report."""
+            if reduce_step:
+                raise RuntimeError("ctx.diagnostic is not available in reduce(ctx): report checks from run(ctx)")
             a = np.asarray(array, dtype=np.float32)
             if used[0] + a.nbytes > max_diag_bytes:
                 log(f"diagnostic '{name}' dropped: size budget exceeded")
@@ -105,6 +115,19 @@ class Context:
             libs[key] = ctypes.CDLL(str(out))
             return libs[key]
 
+        loaded: dict = {}
+
+        def reduction() -> dict:
+            """Products of the algorithm's preliminary reduction step (reduction/reduce.py): the dict
+            that reduce(ctx) returned, as read-only arrays."""
+            if reduce_step or products is None:
+                raise RuntimeError("this algorithm has no preliminary reduction step (reduction/reduce.py)")
+            if not loaded:
+                for p in sorted(Path(products).glob("*.npy")):
+                    loaded[p.name[:-4]] = np.load(p, mmap_mode="r", allow_pickle=False)
+            return dict(loaded)
+
+        self.reduction = reduction
         self.native_file, self.native_library = native_file, native_library
         self.scratch_file, self.log, self.metric, self.diagnostic = scratch_file, log, metric, diagnostic
         self.elapsed = elapsed
@@ -124,8 +147,29 @@ def build_view(view: dict):
     return be, index, shift
 
 
+_PRODUCT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+def save_products(out, dest: Path) -> list[str]:
+    """Write what reduce(ctx) returned: a dict of numeric arrays, one .npy file each."""
+    if not isinstance(out, dict) or not out:
+        raise TypeError("reduce(ctx) must return a non-empty dict {name: numeric array}")
+    if len(out) > 64:
+        raise ValueError("reduce(ctx) may return at most 64 arrays")
+    for k, v in out.items():
+        if not isinstance(k, str) or not _PRODUCT_NAME.match(k):
+            raise ValueError(f"product name {str(k)[:40]!r} must be a simple identifier")
+        a = np.asarray(v)
+        if a.dtype.kind not in "biufc":
+            raise TypeError(f"product '{k}' must be a numeric or boolean array, not dtype {a.dtype}")
+        np.save(dest / f"{k}.npy", np.ascontiguousarray(a), allow_pickle=False)
+    return list(out)
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["run", "reduce"], default="run")
+    ap.add_argument("--products", default="", help="run: products to hand to ctx.reduction(); reduce: where to write them")
     ap.add_argument("--alg-dir", required=True)
     ap.add_argument("--view", required=True)
     ap.add_argument("--out", required=True)
@@ -140,19 +184,37 @@ def main(argv=None) -> None:
     ds = SolarDataset(be, index, shift)
     del shift, be
     Path(a.scratch).mkdir(parents=True, exist_ok=True)
+    reduce_step = a.mode == "reduce"
+    # the reduction step sees only its own directory: reduction/*.py and reduction/native/
+    code_dir = Path(a.alg_dir).resolve() / ("reduction" if reduce_step else "")
     ctx = Context(ds, Path(a.scratch), a.cpus, bool(a.gpu), a.time_budget_s,
                   seed=int(view.get("alg_seed", 0)), max_diag_bytes=int(view["max_diag_bytes"]),
-                  alg_dir=Path(a.alg_dir).resolve())
+                  alg_dir=code_dir, products=Path(a.products) if (a.products and not reduce_step) else None,
+                  reduce_step=reduce_step)
 
     for k in list(os.environ):                              # nothing harness-related in the env
         if k.startswith(("RVSWARM", "NEID", "ANTHROPIC", "SLURM_JOB_NAME")):
             os.environ.pop(k)
-    alg_dir = str(Path(a.alg_dir).resolve())
+    alg_dir = str(code_dir)
     sys.path.insert(0, alg_dir)
     status, err = "ok", ""
     rv = np.full(ds.n_obs, np.nan)
     rv_err = np.full(ds.n_obs, np.nan)
     t_start = time.time()
+    if reduce_step:
+        names: list[str] = []
+        try:
+            spec = importlib.util.spec_from_file_location("reduction_step", os.path.join(alg_dir, "reduce.py"))
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["reduction_step"] = mod
+            spec.loader.exec_module(mod)
+            names = save_products(mod.reduce(ctx), Path(a.products))
+        except BaseException:                               # report *any* failure, incl. SystemExit
+            status, err = "error", traceback.format_exc(limit=8)
+            print(err, file=sys.stderr, flush=True)
+        np.savez(a.out, status=status, error=err, runtime_s=time.time() - t_start,
+                 names=np.array(names, dtype=str))
+        sys.exit(0 if status == "ok" else 3)
     try:
         spec = importlib.util.spec_from_file_location("algorithm", os.path.join(alg_dir, "algorithm.py"))
         mod = importlib.util.module_from_spec(spec)

@@ -76,23 +76,23 @@ a result directory (`workspace/results/<id>/<stage>_NN/`).
 | `config/local.env` | this swarm's name and data directories (not in git) | `bin/new_swarm.sh`, you |
 | `config/local_swarm.yaml` | this swarm's own settings: its panel after a move, its scope, its pace (not in git; overrides `swarm.yaml`) | `bin/swarm.sh move`, you |
 | `config/trial.yaml` | overlay for the short capped trial run (section 6.0) | you |
-| `baselines/` | 3 reference algorithms + 3 canary cheaters | fixed code |
+| `baselines/` | 3 reference algorithms + 4 canary cheaters | fixed code |
 | `swarm/` | orchestrator: `cycle.py`, `llm.py`, `prompts.py`, `registry.py`, `tools.py`; `transfer.py` (timing, moving between swarms) | fixed code |
 | `workspace/docs/` | problem brief, data description, algorithm interface (what agents are told) | you |
 | `workspace/literature/` | method cards with citations | librarian agent |
 | `workspace/proposals/cNNN/<id>/` | `PROPOSAL.md`, per round `CRITIQUE_rN_<skeptic>.md` and `DRAFT_rN.md`, final `SPEC.md`; `../DEBATE_SUMMARY.md` | proposers, skeptics |
 | `workspace/selected/cNNN_SELECTION.md` | what was chosen, why, quota ledger, redirects | moderators + rule |
-| `workspace/algorithms/<id>/` | `SPEC.md`, `algorithm.py`, `algorithm.yaml`, `IMPLEMENTATION_NOTES.md`, `REVIEW.md` | implementers, reviewer |
-| `workspace/results/<id>/<stage>_NN/` | `report.md`, `metrics.json`, code snapshot, log | harness only |
+| `workspace/algorithms/<id>/` | `SPEC.md`, `algorithm.py`, `algorithm.yaml`, `IMPLEMENTATION_NOTES.md`, `REVIEW.md`; optional `reduction/` (a preliminary reduction step, section 10.2) | implementers, reviewer; a reused `reduction/` is copied in by the orchestrator |
+| `workspace/results/<id>/<stage>_NN/` | `report.md`, `metrics.json`, code snapshot | harness only |
 | `workspace/postmortems/` | proposer's reading of each result | proposers |
 | `workspace/seminars/` | multi-specialist discussions of "why did X behave like that?" | panel + minute-taker |
 | `workspace/crosspollination/` | briefs combining strengths of different families | synthesist |
-| `workspace/registry/` | `registry.json`, `REGISTRY.md`, `LEADERBOARD.md` | orchestrator |
+| `workspace/registry/` | `registry.json`, `REGISTRY.md`, `LEADERBOARD.md`, `REDUCTIONS.md` | orchestrator |
 | `workspace/digests/` | one page per cycle for humans | reporter |
 | `workspace/human_suggestions/` | your steering notes | **you** |
 | `workspace/diagnostic_requests/` | agents' requests for harness changes | agents → you |
 | `workspace/agents/<slot>/notebook.md` | each proposer's private notes to its future self | proposers |
-| `state/` | cycle state, spending ledger, tickets, SLURM logs, injection truth; `TIMING.md`, `moved/` and `moves.log` (moves between swarms), `sealed_diagnostics/` | orchestrator, harness |
+| `state/` | cycle state, spending ledger, tickets, SLURM logs, injection truth; `TIMING.md`, `moved/` and `moves.log` (moves between swarms), `sealed_diagnostics/`; `algorithm_outputs/` (full logs and arrays of every run, for you), `reduction_cache/` and `run_cache/` (section 10.2) | orchestrator, harness |
 | `secrets/harness_secret.key` | seeds the hidden planets (auto-created, mode 600) | harness |
 
 ## 3. One-time setup
@@ -289,6 +289,11 @@ bin/swarm.sh move --to ../rvswarm_B --alg c004_P09 --apply           # single pr
   `state/moved/<date>_move_to_B/`, with the id map in `IMPORTED.json`; `state/moves.log`
   lists every move.
 * `--copy` imports into the destination and changes nothing in the source.
+* Cached products do not move: they belong to the source swarm's data, and the
+  destination computes them once on its own. A preliminary reduction step (section 10.2)
+  moves as code inside each algorithm, byte for byte, so the destination's proposers can
+  reuse it under its new id. Algorithms left in the source that reused a moved one's
+  reduction step keep their own copy of it.
 
 After the first move the panel of each swarm lives in `config/local_swarm.yaml` (not in
 git), which overrides `proposer_slots` of `config/swarm.yaml`; edit the panel there from
@@ -445,6 +450,7 @@ What to check on the real data:
 | `canary_constant` | RMS 0, transfer 0, gate **FAIL** |
 | `canary_time_smoother` | impressive RMS, transfer far below 0.8, gate **FAIL** |
 | `canary_drop_half` | gate **FAIL** (too many missing outputs) |
+| `canary_crossrun` | gate **FAIL**. It passes only if one run of an evaluation can leave a file that a later run finds: then the container template mounts too much (section 10.3). Without a container it passes, as it should (it writes `rvswarm_canary_crossrun.npy` a few directories above its run directory, which you may delete). In a swarm initialised before this canary existed (2026-11-18), run `bin/swarm.sh init` once more to add and queue it |
 | `baseline_indicator_decorr`, `baseline_ccf_acf_pca` | gate PASS, modest improvement |
 | scatter-versus-timescale table | sensible |
 
@@ -735,9 +741,19 @@ audit. Agents cannot read that directory.
   tables go to `state/sealed_diagnostics/`, for you). A failing diagnostic is reported as
   not available and the evaluation goes on. Switch one off with
   `residual_diagnostics.disabled` in `config/harness.yaml`. The agents' own requests for
-  diagnostics collect in `workspace/diagnostic_requests/`. (Separately, an algorithm's
-  own logs and `ctx.diagnostic` arrays from development runs are published by design,
-  so an algorithm can print development-data values; sealed reports show neither.)
+  diagnostics collect in `workspace/diagnostic_requests/`.
+* **What an algorithm prints and records about itself** reaches the agents only in
+  reduced form on real data (`algorithm_outputs` in `config/harness.yaml`,
+  `harness/sanitize.py`): in screen and full reports, every digit of its log and error
+  messages is shown as `#` (except `ctx.log` time stamps and traceback line numbers),
+  at most 20 `ctx.metric` values are shown, rounded to 3 significant digits, and
+  `ctx.diagnostic` arrays appear as summaries (arrays of at most 16 values in full).
+  Sealed reports show only the masked error. So an algorithm cannot show the agents
+  per-epoch values of the real data; the most a deliberately leaky algorithm could pass
+  out is about a hundred rounded numbers per evaluation. You see everything: full logs of
+  every run, the metrics and the arrays are in `state/algorithm_outputs/<id>/<stage>_NN/`.
+  The implementers' local test shows everything to them, on synthetic data or your
+  hand-picked frames.
 * **Add a package the agents asked for**: read `workspace/environment_requests/PENDING.md`.
   A proposal lists what it needs under `requires:`; if selected, it waits there instead
   of being implemented. Install the package in the cluster environment, in the sandbox
@@ -798,6 +814,17 @@ protections, roughly in order of importance:
    the outputs, so it is measured to about a percent even for 10 cm/s planets. A
    method that reduces scatter by absorbing signal scores no better
    (`effective RMS = RMS / min transfer`) and fails the gate outside [0.8, 1.2].
+   **The runs cannot talk to each other.** Each process has its own private directory
+   with a random name (its view of the data, its scratch files), deleted when it ends;
+   the harness also removes anything else left in the evaluation's work directory, and
+   under the container a process sees only its own directory. Otherwise an algorithm
+   could leave the un-injected run's pipeline RVs in a file and read them in an injected
+   run: the difference IS the hidden planets, which it could take out before an
+   aggressive correction and put back afterwards. Up to commit b5367e0 (2026-11-18) all
+   runs of an evaluation shared one work directory (mounted whole by the container), and
+   `tests/algs/crossrun_cheat` passes the gate on that version with fake perfect
+   transfer; it fails now. None of the trial's algorithms touched another run's files
+   (checked). `canary_crossrun` checks the container on the cluster.
 3. **Five contiguous period bands, 2-400 days, random periods and phases.** A filter
    in time or frequency cannot avoid them.
 4. **Fixed binning and weights.** Daily bins and pipeline photon weights; the
@@ -814,8 +841,9 @@ protections, roughly in order of importance:
    network, process or introspection access, no absolute paths. The injection is held
    in closures, the per-run shift file is deleted before algorithm code is imported,
    and diagnostics are published only from the un-injected run (differencing two
-   published runs would otherwise reveal the planets).
-8. **Canaries.** Three deliberate cheaters are evaluated with the baselines. If one
+   published runs would otherwise reveal the planets), and only in reduced form
+   (section 9).
+8. **Canaries.** Four deliberate cheaters are evaluated with the baselines. If one
    ever passes the gate, the harness is broken: stop and fix it.
 9. **Independent code review** for fidelity and integrity before anything is queued, and a
    separate numerical review.
@@ -842,6 +870,52 @@ protections, roughly in order of importance:
   `resources.max_cpus` in `config/harness.yaml`.
 * Not changed, for you to decide: the defaults of 8 CPUs and 4 hours per algorithm, and
   the caps (32 CPUs; 8 / 16 / 24 hours per stage).
+* Re-use of identical computations: section 10.2.
+
+### 10.2 Re-using identical computations
+
+Two stores in `state/`, written and read by the harness only (`harness/cache.py`,
+`caching` in `config/harness.yaml`):
+
+* **The un-injected run is not repeated at the full stage.** Screen and full use the
+  same development data, and the un-injected run depends only on the code, the data, the
+  seed and the harness. A full evaluation of unchanged code therefore takes the
+  un-injected run of the screen evaluation from `state/run_cache/` and runs only its two
+  injected runs: a third of every full evaluation saved. The report says so, and every
+  run of an evaluation is given the same `ctx.time_budget_s`, so that the injected runs
+  are comparable with the stored one. Any change to the code, the data, the container
+  command or the harness's data API makes the stored run invalid.
+* **Preliminary reduction steps** (interface section 2a). A proposal can declare
+  `reduction: new` (an expensive first step that depends on the data alone, for example
+  line-by-line RVs, specified in its section 3a) or `reduction: reuse <id>` (that
+  algorithm's step, unchanged). The implementer puts a new step into
+  `workspace/algorithms/<id>/reduction/reduce.py`; for `reuse`, the orchestrator copies the
+  original's `reduction/` in and makes it read-only for the implementer, so the code stays
+  byte-identical and nobody has to guess whether to recompute. The harness runs the step
+  in its own process before the algorithm and stores its products for the run WITHOUT
+  hidden planets in `state/reduction_cache/`, keyed by the reduction code, the data set,
+  the seed, the container command and the harness's data API. Every later algorithm with
+  the same `reduction/`, in any cycle, takes them from there for its un-injected run.
+  This saves most of the CPU time of a pre-check that fails, and about half of a screen
+  evaluation when the step dominates. Runs with hidden planets always compute the step
+  themselves: every algorithm gets its own planets, so their products could never be
+  reused, and computing the planets into a cached product instead would stop testing
+  whether the step itself absorbs them. Proposers see the available steps, with their
+  measured CPU time, in `workspace/registry/REDUCTIONS.md` (during the independent
+  opening cycles only their own). A declared reuse of a step that does not exist is not
+  selected, with the reason in `SELECTION.md`; a reused step brings its original's `uses`
+  into the scope check.
+* **Size and clean-up.** `bin/py.sh -m harness.cache stats` lists the stored products and
+  runs; least recently used products are deleted above `reduction_cache.max_gb` (200 GB);
+  `bin/py.sh -m harness.cache clear` empties both stores (nothing is lost but CPU time).
+  The products can be large (line-by-line RVs of a few hundred spectra: hundreds of MB),
+  so point `$RVSWARM_REDUCTION_CACHE` at a large file system if `state/` is on a small
+  one. A product that disappears (scratch purge) or fails its checksum is recomputed.
+  After you rebuild the container image at the same path, bump `caching.epoch`.
+* **Moving to another swarm**: section 3.6. If two swarms ever share one data set, they
+  may share one reduction cache directory: entries are keyed by the data.
+
+### 10.3 The container
 
 **The container is not optional.** An independent adversarial review of this harness
 confirmed that the static audit can be bypassed by determined code (for example through
@@ -853,7 +927,8 @@ boundary is the container: `harness.evaluate` refuses real-data stages unless
 `RVSWARM_SANDBOX_CMD` is set, and every result records `sandboxed: true/false`.
 
 The wrapper must give the algorithm process: the `harness/` package (read-only), its
-code snapshot (read-only), its per-run work directory (writable), the store and the L2
+code snapshot (read-only), its own run directory `$RVSWARM_RUN_WORK` (writable; one per
+process, never the directory above it), the store and the L2
 data (read-only), the Python environment, a GPU if requested -- and nothing else: no
 `secrets/`, no `state/`, no `workspace/`, no home directory, no network. The harness
 substitutes `$RVSWARM_HARNESS_DIR`, `$RVSWARM_RUN_SNAP` and `$RVSWARM_RUN_WORK` into the
@@ -1017,7 +1092,10 @@ What to do with these numbers:
 | literature phase fails with a 400 | web tools not enabled for the organisation; the code falls back to memory-only cards. Or set `literature.web: false` |
 | ticket stuck in `state/eval_submitted/` | the SLURM job died without reporting. After job time + 3 days it is closed automatically as `job_lost`; to retry sooner, move the file back to `state/eval_queue/` |
 | result `status: audit_failed` | the report lists the offending lines; the proposer sees it in the post-mortem phase |
-| result `status: run_failed` | traceback is in the report; SLURM log in `state/slurm_logs/` |
+| result `status: run_failed` | traceback is in the report (digits masked); full log of every run in `state/algorithm_outputs/<id>/<stage>_NN/`; SLURM log in `state/slurm_logs/` |
+| report says `preliminary reduction step ... FAILED` | the algorithm's `reduction/reduce.py` crashed or returned something other than numeric arrays; the traceback is in the report, the full log in `state/algorithm_outputs/` |
+| `state/reduction_cache/` grows large | `bin/py.sh -m harness.cache stats`; lower `caching.reduction_cache.max_gb`, or move it with `$RVSWARM_REDUCTION_CACHE` (section 10.2) |
+| you want an algorithm's full log, metrics or arrays | `state/algorithm_outputs/<id>/<stage>_NN/` (the agents see them only in reduced form) |
 | `Another orchestrator process is working on this swarm` | a `loop`, `run` or `move` is running in this swarm (its pid is in `state/orchestrator.lock`): stop it first. The lock is released when the process ends, so a leftover file is harmless |
 | `move` refuses: `in the middle of cycle N` | let the cycle finish (`bin/swarm.sh run`), then move |
 | result has `injection_skipped: true` | the pre-check found no reduction of the pipeline scatter, so no planets were injected (section 10.1). Not an error |
@@ -1044,7 +1122,15 @@ Tested here:
   subprocess runs, scoring, reports, promotion, tickets, `submit_eval.sh --local`.
 * Honest baselines pass and all three canaries and the forbidden-code example fail.
 * The pre-check: an algorithm that returns the pipeline RV gets no injection run at the
-  screen stage; baselines still get theirs (`tests/selftest.sh`, 10 checks).
+  screen stage; baselines still get theirs.
+* Isolation of runs: `tests/algs/crossrun_cheat` passes the gate with fake perfect transfer
+  on the harness of commit b5367e0 and fails on the current one; the output filter on an
+  algorithm that tries to print the data; the reduction cache and the reuse of the
+  un-injected run at the full stage (`tests/selftest.sh`, 14 checks).
+* Reduction steps through the orchestration with mock replies, three cycles: `new` and
+  `reuse` declarations, the copy into the implementer's directory and its refusal to
+  write there, the moderation check, `REDUCTIONS.md`, cache hits at the toy, screen and
+  full stages, and moving such an algorithm (code copied byte for byte).
 * The numerical analyst, the performance engineer, the optimisation pass and the
   restoring of the reviewed code when the optimised code fails review, with mock replies.
 * The residual diagnostics on the synthetic Sun (screen, pre-check and sealed reports).
@@ -1057,7 +1143,10 @@ Not tested here, because this container has no API key, no `sbatch` and only 16
 spectra from one hour:
 
 * **The container wrapper** (`RVSWARM_SANDBOX_CMD`). Only the substitution mechanism was
-  tested, with a dummy wrapper. Build and test the real one before trusting any score.
+  tested, with a dummy wrapper. Build and test the real one before trusting any score;
+  `canary_crossrun` must fail the gate with it.
+* **The reduction cache on the cluster's file systems** (sizes, scratch purges, many jobs
+  writing at once) and with real line-by-line products.
 * **The full-scale configuration with the live API** (24 proposers, 5 debate rounds, 12
   implementations, 70 turns, 4 repair rounds, 1-hour cache). It was run only with canned
   replies. Watch the first full cycle of the first swarm before starting the other two.

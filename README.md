@@ -13,7 +13,9 @@ The project runs three fully independent swarms, each on its own curated set of 
 500 spectra (RUNBOOK section 3.5), with a combined API budget of 200 000 USD over six
 months (RUNBOOK section 11). Once their CPU cost is known, proposers or whole families of
 methods can be moved between swarms, for example to run fast and slow methods at
-different paces (RUNBOOK section 3.6).
+different paces (RUNBOOK section 3.6). An expensive first step that later methods can
+build on, such as line-by-line RVs, can be declared as a reduction step: it is computed
+once per data set and reused (RUNBOOK section 10.2).
 
 **Start with [`RUNBOOK.md`](RUNBOOK.md).** It covers setup, validation, running,
 monitoring, steering and the integrity design.

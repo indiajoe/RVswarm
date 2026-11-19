@@ -34,21 +34,21 @@ def _lang_of(path: Path) -> str | None:
     return None
 
 
-def audit_native(native_dir: Path, cfg_native: dict) -> list[str]:
+def audit_native(native_dir: Path, cfg_native: dict, label: str = "native/") -> list[str]:
     problems = []
     langs = set(cfg_native.get("languages", []))
     total = 0
     for p in sorted(native_dir.iterdir()):
         if p.is_dir():
-            problems.append(f"native/{p.name}: sub-directories are not allowed in native/")
+            problems.append(f"{label}{p.name}: sub-directories are not allowed in {label}")
             continue
         lang = _lang_of(p)
         if lang is None:
-            problems.append(f"native/{p.name}: only source files are allowed "
+            problems.append(f"{label}{p.name}: only source files are allowed "
                             f"({', '.join(e for l in sorted(langs) for e in NATIVE_EXT[l])})")
             continue
         if lang not in langs:
-            problems.append(f"native/{p.name}: language '{lang}' is not enabled on this cluster "
+            problems.append(f"{label}{p.name}: language '{lang}' is not enabled on this cluster "
                             f"(enabled: {sorted(langs)}); request it in workspace/environment_requests/")
             continue
         src = p.read_text(errors="replace")
@@ -57,10 +57,10 @@ def audit_native(native_dir: Path, cfg_native: dict) -> list[str]:
         for n, line in enumerate(src.splitlines(), 1):
             m = rx.search(line)
             if m:
-                problems.append(f"native/{p.name}:{n}: '{m.group(0).strip()}' is not allowed "
+                problems.append(f"{label}{p.name}:{n}: '{m.group(0).strip()}' is not allowed "
                                 "(no file, process, network or environment access from native code)")
     if total > int(cfg_native.get("max_source_bytes", 2_000_000)):
-        problems.append("native/: sources exceed the size limit")
+        problems.append(f"{label}: sources exceed the size limit")
     return problems
 
 FORBIDDEN_CALLS = {
@@ -126,33 +126,54 @@ def audit_source(src: str, filename: str, allowed: set[str], forbidden_sub: list
     return problems
 
 
-def audit_dir(alg_dir, cfg_audit: dict) -> list[str]:
-    alg_dir = Path(alg_dir)
-    files = sorted(alg_dir.glob("*.py"))
-    if not (alg_dir / "algorithm.py").exists():
-        return ["algorithm.py is missing"]
+def _audit_code(d: Path, cfg_audit: dict, label: str, subdirs: tuple) -> list[str]:
+    """One code directory: its *.py files (which may import each other), native/, nothing else."""
+    files = sorted(d.glob("*.py"))
     local = {p.stem for p in files}
     problems: list[str] = []
     allowed = set(cfg_audit["allowed_imports"])
     forbidden = list(cfg_audit["forbidden_submodules"])
     nat_cfg = cfg_audit.get("native") or {}
-    native = alg_dir / "native"
+    native = d / "native"
     if native.is_dir():
         if not nat_cfg.get("languages"):
-            problems.append("native/: native code is not enabled in config/harness.yaml (audit.native.languages)")
+            problems.append(f"{label}native/: native code is not enabled in config/harness.yaml (audit.native.languages)")
         else:
-            problems += audit_native(native, nat_cfg)
+            problems += audit_native(native, nat_cfg, f"{label}native/")
             allowed |= set(nat_cfg.get("extra_imports", []))      # ctypes / juliacall, to call the native code
             forbidden = [f for f in forbidden if f != "numpy.ctypeslib"]
     for p in files:
-        problems += audit_source(p.read_text(), p.name, allowed, forbidden, local)
-    for p in alg_dir.iterdir():
-        if p.is_dir() and p.name not in ("native", "__pycache__"):
-            problems.append(f"sub-directory '{p.name}/' is not allowed (only native/ for compiled-language sources)")
-    extra = [p.name for p in alg_dir.iterdir()
+        problems += audit_source(p.read_text(), f"{label}{p.name}", allowed, forbidden, local)
+    for p in d.iterdir():
+        if p.is_dir() and p.name not in subdirs + ("native", "__pycache__"):
+            problems.append(f"sub-directory '{label}{p.name}/' is not allowed")
+    extra = [p.name for p in d.iterdir()
              if p.suffix in (".so", ".pyc", ".pyd", ".sh", ".pkl", ".pt", ".npy", ".npz", ".o", ".a", ".dylib")]
     if extra:
-        problems.append(f"binary / executable files are not allowed in an algorithm dir: {extra}")
+        problems.append(f"binary / executable files are not allowed in an algorithm dir: {[label + x for x in extra]}")
+    return problems
+
+
+def audit_dir(alg_dir, cfg_audit: dict) -> list[str]:
+    """algorithm.py and its helpers; optionally native/ and a preliminary reduction step in reduction/
+    (its own code, which algorithm.py cannot import: the two only share the products)."""
+    alg_dir = Path(alg_dir)
+    if not (alg_dir / "algorithm.py").exists():
+        return ["algorithm.py is missing"]
+    problems = _audit_code(alg_dir, cfg_audit, "", ("reduction",))
+    red = alg_dir / "reduction"
+    if red.is_dir():
+        entry = red / "reduce.py"
+        if not entry.exists():
+            problems.append("reduction/reduce.py is missing: a reduction/ directory must define reduce(ctx) there")
+        else:
+            try:
+                tree = ast.parse(entry.read_text(), "reduction/reduce.py")
+                if not any(isinstance(n, ast.FunctionDef) and n.name == "reduce" for n in tree.body):
+                    problems.append("reduction/reduce.py must define a top-level function reduce(ctx)")
+            except SyntaxError:
+                pass                                           # reported by the source audit below
+        problems += _audit_code(red, cfg_audit, "reduction/", ())
     return problems
 
 

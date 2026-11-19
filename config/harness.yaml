@@ -80,6 +80,34 @@ residual_diagnostics:
   max_numbers: 60            # numbers one diagnostic may publish; the rest is cut off
   significant_digits: 3      # floats are rounded to this many significant digits
 
+# What an algorithm's OWN output (its log, error messages, ctx.metric, ctx.diagnostic) may publish
+# in screen and full reports: digits in text are masked, numbers rounded and capped, long arrays
+# summarised (harness/sanitize.py). Sealed reports publish only the masked error text. Everything
+# is kept in full for the humans in state/algorithm_outputs/<alg>/<run>/. The local toy test
+# (synthetic data or a few hand-picked frames) shows everything.
+algorithm_outputs:
+  max_metrics: 20            # ctx.metric values shown
+  max_arrays: 8              # ctx.diagnostic arrays shown (as summaries)
+  max_array_values: 16       # arrays up to this size are shown value by value
+  max_log_lines: 40          # last lines of the un-injected run's log
+  significant_digits: 3
+
+# Re-use of identical computations, to save CPU time (harness/cache.py, RUNBOOK section 10.2).
+caching:
+  epoch: 1                   # bump to make every stored result invalid (e.g. after rebuilding the container image)
+  # A full evaluation takes the un-injected run of the screen evaluation of the same code (same
+  # data, same seed, same harness) instead of running it again: one run in three saved.
+  reuse_uninjected_run: true
+  # Products of a preliminary reduction step (reduction/reduce.py of an algorithm) on the
+  # un-injected data, shared by every algorithm with byte-identical reduction code. Injected
+  # runs always compute their own (each algorithm has its own hidden planets).
+  reduction_cache:
+    enabled: true
+    dir: state/reduction_cache   # override: $RVSWARM_REDUCTION_CACHE (a large file system; Roar scratch is fine)
+    max_gb: 200                  # least recently used entries are deleted above this
+    max_entry_gb: 8              # larger products are used for the run but not stored
+    max_products_gb: 32          # larger products fail the run
+
 promotion:                       # applied by harness/promote.py -- no agent input
   screen_to_full_max_ratio: 0.95       # effective_rms / raw_rms must be below this
   full_to_sealed_max_ratio: 0.60

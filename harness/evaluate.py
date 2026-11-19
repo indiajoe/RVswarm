@@ -4,9 +4,15 @@
     python -m harness.evaluate --alg-dir path/to/dir --stage toy      # local: a few real frames, or synthetic
 
 The algorithm is run once without hidden planets and then n times with them, each in a
-fresh process. At the stages listed under `precheck` in config/harness.yaml the injected
-runs are skipped (to save CPU time) when the un-injected run does not reduce the scatter
-of the pipeline RVs. Results go to workspace/results/<alg_id>/<stage>_<NN>/.
+fresh process with its own private directory, which is deleted when the process ends (the
+container mounts only that directory). At the stages listed under `precheck` in
+config/harness.yaml the injected runs are skipped (to save CPU time) when the un-injected run
+does not reduce the scatter of the pipeline RVs. Identical computations are not repeated
+(harness/cache.py): a full evaluation takes the un-injected run of the screen evaluation of the
+same code, and the products of a preliminary reduction step (reduction/reduce.py) on the
+un-injected data are cached. Results go to workspace/results/<alg_id>/<stage>_<NN>/; what the
+algorithm itself prints and records is published only in reduced form (harness/sanitize.py)
+and kept in full under state/algorithm_outputs/.
 """
 from __future__ import annotations
 
@@ -15,10 +21,12 @@ import hashlib
 import json
 import os
 import resource
+import secrets
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -28,17 +36,29 @@ if __name__ == "__main__":
     # The harness's own numerics (scoring, residual diagnostics) take well under a second.
     # Keep this process's BLAS single-threaded: threads gain nothing here, and a threaded
     # OpenBLAS was seen to spin for good on an oversubscribed host. Algorithm runs get
-    # their own thread counts in run_one().
+    # their own thread counts in process().
     for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ[_v] = "1"
 
 import numpy as np
 import yaml
 
-from . import audit, backends, config, injection, residual_diagnostics, score
+from . import audit, backends, cache, config, injection, residual_diagnostics, sanitize, score
 
 # sparse like the curated real set: about one epoch every three days
 TOY_BACKEND = {"kind": "synth", "seed": 3, "n_days": 900, "obs_per_day": 1, "day_keep": 0.33}
+ALG_SEED = 12345                    # ctx.seed: the same in every run, so that runs differ only by the planets
+
+
+def _tail(text: str, n: int = 60) -> str:
+    return "\n".join(l[:300] for l in str(text or "").splitlines()[-n:])
+
+
+def _read(p: Path, max_chars: int = 2_000_000) -> str:
+    try:
+        return p.read_text(errors="replace")[-max_chars:]
+    except OSError:
+        return ""
 
 
 def read_manifest(alg_dir: Path, cfg: dict) -> dict:
@@ -193,7 +213,26 @@ def write_report(out: Path, alg_id: str, stage: str, m: dict, man: dict, runs: l
           f"({m.get('cpu_utilisation', float('nan')):.0%} of the cores that were reserved for that long). "
           "Low utilisation means the request was larger than the code can use.",
           "- run statuses: " + ", ".join(r["status"] for r in runs)]
-    if publish_details and runs:
+    if m.get("uninjected_run_reused_from"):
+        L.append(f"- the un-injected run was not repeated: it is the one of `{m['uninjected_run_reused_from']}` "
+                 "(same code, same data, same seed); its wall time above is from then")
+    red = m.get("reduction")
+    if red:
+        parts = []
+        for r, x in enumerate(red.get("runs") or []):
+            name = "un-injected run" if r == 0 else f"injected run {r}"
+            if not x:
+                continue
+            if x.get("cached"):
+                parts.append(f"{name}: products taken from the cache (first computed by `{x.get('first_computed_by')}` "
+                             f"in {x.get('first_run_dir')}, {float(x.get('cost_s') or 0) / 60:.1f} min)")
+            elif x.get("failed"):
+                parts.append(f"{name}: FAILED")
+            else:
+                parts.append(f"{name}: computed in {float(x.get('seconds') or 0) / 60:.1f} min"
+                             + (", stored for reuse" if x.get("stored") == "stored" else ""))
+        L.append(f"- preliminary reduction step (reduction/, code hash `{red.get('sha')}`): " + "; ".join(parts))
+    if stage == "toy" and runs:                 # local test data: everything is shown
         r0 = runs[0]
         if r0["metrics"]:
             L += ["", "## Intermediate checks reported by the algorithm (un-injected run)", ""]
@@ -202,51 +241,14 @@ def write_report(out: Path, alg_id: str, stage: str, m: dict, man: dict, runs: l
             L += ["", "## Diagnostics arrays reported by the algorithm (un-injected run)", ""]
             for k, v in r0["diags"].items():
                 L += [f"### `{k}`", "```", _array_text(v), "```"]
-        L += ["", "## Log tail (un-injected run)", "```", r0["log_tail"], "```"]
+        L += ["", "## Log tail (un-injected run)", "```", _tail(r0.get("log", "")), "```"]
+    elif publish_details and m.get("algorithm_outputs"):
+        o = m["algorithm_outputs"]
+        L += ["", sanitize.to_markdown(o["metrics"], o["more_metrics"], o["diagnostics"], o["more_diagnostics"],
+                                       o["log_tail"], sanitize.limits(cfg))]
     elif not publish_details:
         L += ["", "_Sealed-data run: algorithm logs and diagnostics are deliberately not published._"]
     (out / "report.md").write_text("\n".join(L) + "\n")
-
-
-def run_one(py: str, snap: Path, view_file: Path, out_npz: Path, scratch: Path, log: Path,
-            res: dict, timeout_s: float, cpus: int) -> dict:
-    cmd = [py, "-m", "harness.runner", "--alg-dir", str(snap), "--view", str(view_file),
-           "--out", str(out_npz), "--scratch", str(scratch), "--cpus", str(cpus),
-           "--gpu", str(res["gpus"]), "--time-budget-s", str(int(timeout_s * 0.9))]
-    env = dict(os.environ, PYTHONPATH=str(config.ROOT), OMP_NUM_THREADS=str(cpus),
-               MKL_NUM_THREADS=str(cpus), OPENBLAS_NUM_THREADS=str(cpus),
-               RVSWARM_RUN_WORK=str(view_file.parent), RVSWARM_RUN_SNAP=str(snap),
-               RVSWARM_HARNESS_DIR=str(config.ROOT / "harness"))
-    sandbox = os.environ.get("RVSWARM_SANDBOX_CMD", "").strip()
-    if sandbox:                                   # $RVSWARM_RUN_WORK etc. are expanded in the template
-        cmd = shlex.split(Template(sandbox).safe_substitute(env)) + cmd
-    t0 = time.time()
-    status = "ok"
-    with open(log, "w") as fh:
-        try:
-            rc = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, env=env,
-                                cwd=str(view_file.parent), timeout=timeout_s).returncode
-            if rc != 0:
-                status = "error"
-        except subprocess.TimeoutExpired:
-            status = "timeout"
-    out = {"status": status, "runtime_s": time.time() - t0, "metrics": {}, "diags": {},
-           "rv_clean": None, "error": ""}
-    lines = log.read_text(errors="replace").splitlines()
-    out["log_tail"] = "\n".join(l[:300] for l in lines[-60:])
-    if out_npz.exists():
-        z = np.load(out_npz, allow_pickle=False)
-        out["rv_clean"] = z["rv_clean"]
-        out["error"] = str(z["error"])
-        out["metrics"] = dict(zip([str(k) for k in z["metric_names"]], z["metric_values"].tolist()))
-        out["diags"] = {k[6:]: z[k] for k in z.files if k.startswith("diag__")}
-        if str(z["status"]) != "ok":
-            out["status"] = "error"
-    elif status == "ok":
-        out["status"] = "error"
-    if out["status"] != "ok" and not out["error"]:
-        out["error"] = f"{out['status']}; log tail:\n" + out["log_tail"]
-    return out
 
 
 def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Path | None = None,
@@ -267,6 +269,11 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
     shutil.copytree(alg_dir, snap, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     meta["code_sha"] = _sha_dir(snap)
     publish = stage != "sealed"
+    toy = stage == "toy"
+    lim = sanitize.limits(cfg)
+    # text the algorithm controls (tracebacks, log tails) is published with digits masked, except
+    # from the local toy test
+    public = (lambda x: str(x or "")) if toy else (lambda x: sanitize.mask_text(x, lim))
     runs: list[dict] = []
 
     def finish(extra: dict) -> dict:
@@ -326,7 +333,8 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
     t0 = float(np.floor(t.min()))
     work = Path(os.environ.get("RVSWARM_WORKDIR") or os.environ.get("TMPDIR") or out) / f"rvswarm_{alg_id}_{out.name}_{os.getpid()}"
     work.mkdir(parents=True, exist_ok=True)
-    np.save(work / "index.npy", index)
+    logs = work / "logs"                         # written by the harness; never inside a run directory
+    logs.mkdir(exist_ok=True)
     n_runs = 1 + int(stage_cfg["n_injections"])
     ep = f"{cfg['injection']['epoch']}" + (f"/draw{meta['data_draw']}" if meta.get("data_draw") else "")
     tags = [None] + [f"{ep}|{stage}|{r}|{alg_id}|{meta['code_sha']}"
@@ -335,32 +343,173 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
     for r, tag in enumerate(tags):
         planets = [] if tag is None else injection.draw_planets(
             config.derive_seed("inj", tag), float(t.max() - t.min()), cfg["injection"])
-        s = injection.signal(planets, t, t0)
-        shift_file = work / f"shift_{r}.npy"
-        np.save(shift_file, s)
-        view = {"backend": backend_spec, "index_file": str(work / "index.npy"),
-                "shift_file": str(shift_file), "alg_seed": 12345,
-                "max_diag_bytes": cfg["audit"]["max_diagnostic_bytes"]}
-        (work / f"view_{r}.json").write_text(json.dumps(view))
-        plans.append({"planets": planets, "truth": s})
+        plans.append({"planets": planets, "truth": injection.signal(planets, t, t0)})
     # The un-injected run goes first, alone, on all granted cores. The injected runs follow,
     # concurrently if the algorithm asked for that (then each of the two phases gets half
     # of the wall time).
     par = (n_runs - 1) if (res["parallel_runs"] and res["gpus"] == 0) else 1
     timeout = hours * 3600 / (2 if par > 1 else n_runs)
+    budget = int(timeout * 0.9)                 # ctx.time_budget_s: the same in every run of an evaluation
     py = sys.executable
 
-    def go(r: int, cpus: int) -> dict:
-        return run_one(py, snap, work / f"view_{r}.json", work / f"out_{r}.npz", work / f"scratch_{r}",
-                       out / f"run_{r}.log" if publish and r == 0 else work / f"run_{r}.log",
-                       res, timeout, cpus)
+    # ---- re-use of identical computations (harness/cache.py)
+    data_id = cache.data_identity(backend_spec, index)
+    hsha, env_id = cache.harness_sha(), cache.environment_identity(cfg)
+    rcache, runcache = cache.ReductionCache(cfg), cache.RunCache(cfg)
+    has_red = (snap / "reduction" / "reduce.py").is_file()
+    red_sha = cache.tree_sha(snap / "reduction") if has_red else None
+    red_key = rcache.key(red_sha, data_id, hsha, env_id, ALG_SEED) if has_red else None
+    max_products = float(((cfg.get("caching") or {}).get("reduction_cache") or {}).get("max_products_gb", 32)) * 1e9
+
+    # ---- private directories: one per process, random name, deleted when the process ends. Under
+    # the container a process sees only its own directory; without it, nothing of an earlier run
+    # is left where a later run could look (sweep() removes anything else put in `work`).
+    active: set[str] = set()
+    lock = threading.Lock()
+
+    def sweep() -> None:
+        if keep_scratch:
+            return
+        with lock:
+            for q in work.iterdir():
+                if q.name != "logs" and q.name not in active:
+                    if q.is_dir() and not q.is_symlink():
+                        shutil.rmtree(q, ignore_errors=True)
+                    else:
+                        q.unlink(missing_ok=True)
+
+    def new_dir(kind: str, r: int) -> Path:
+        with lock:
+            d = work / f"{kind}{r}_{secrets.token_hex(8)}"
+            d.mkdir()
+            active.add(d.name)
+        (d / "scratch").mkdir()
+        np.save(d / "index.npy", index)
+        np.save(d / "shift.npy", plans[r]["truth"])           # the runner deletes it before loading any code
+        (d / "view.json").write_text(json.dumps(
+            {"backend": backend_spec, "index_file": str(d / "index.npy"), "shift_file": str(d / "shift.npy"),
+             "alg_seed": ALG_SEED, "max_diag_bytes": cfg["audit"]["max_diagnostic_bytes"]}))
+        return d
+
+    def drop_dir(d: Path) -> None:
+        with lock:
+            active.discard(d.name)
+        if not keep_scratch:
+            shutil.rmtree(d, ignore_errors=True)
+        sweep()
+
+    def process(mode: str, d: Path, timeout_s: float, cpus: int, budget_s: int, log: Path,
+                products: Path | None = None) -> dict:
+        cmd = [py, "-m", "harness.runner", "--mode", mode, "--alg-dir", str(snap), "--view", str(d / "view.json"),
+               "--out", str(d / "out.npz"), "--scratch", str(d / "scratch"), "--cpus", str(cpus),
+               "--gpu", str(res["gpus"]), "--time-budget-s", str(int(budget_s))]
+        if products is not None:
+            cmd += ["--products", str(products)]
+        env = dict(os.environ, PYTHONPATH=str(config.ROOT), OMP_NUM_THREADS=str(cpus),
+                   MKL_NUM_THREADS=str(cpus), OPENBLAS_NUM_THREADS=str(cpus),
+                   RVSWARM_RUN_WORK=str(d), RVSWARM_RUN_SNAP=str(snap),
+                   RVSWARM_HARNESS_DIR=str(config.ROOT / "harness"))
+        sandbox = os.environ.get("RVSWARM_SANDBOX_CMD", "").strip()
+        if sandbox:                               # $RVSWARM_RUN_WORK etc. are expanded in the template
+            cmd = shlex.split(Template(sandbox).safe_substitute(env)) + cmd
+        t1, status = time.time(), "ok"
+        with open(log, "a") as fh:
+            fh.write("----- " + ("preliminary reduction step (reduction/reduce.py)" if mode == "reduce"
+                                 else "algorithm (algorithm.py)") + " -----\n")
+            fh.flush()
+            try:
+                if subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, env=env, cwd=str(d),
+                                  timeout=timeout_s).returncode != 0:
+                    status = "error"
+            except subprocess.TimeoutExpired:
+                status = "timeout"
+        o = {"status": status, "runtime_s": time.time() - t1, "metrics": {}, "diags": {}, "rv_clean": None, "error": ""}
+        f = d / "out.npz"
+        if f.exists():
+            try:
+                z = np.load(f, allow_pickle=False)
+                o["error"] = str(z["error"])
+                if mode == "run":
+                    o["rv_clean"] = z["rv_clean"]
+                    o["metrics"] = dict(zip([str(k) for k in z["metric_names"]], z["metric_values"].tolist()))
+                    o["diags"] = {k[6:]: z[k] for k in z.files if k.startswith("diag__")}
+                if str(z["status"]) != "ok":
+                    o["status"] = "error"
+            except Exception as e:
+                o["status"], o["error"] = "error", f"the run's output could not be read ({type(e).__name__})"
+        elif status == "ok":
+            o["status"] = "error"
+        if o["status"] != "ok" and not o["error"]:
+            o["error"] = f"{o['status']}; log tail:\n" + _tail(_read(log))
+        return o
+
+    def reduction_step(r: int, cpus: int, budget_s: int, log: Path, dest: Path) -> dict:
+        """Products of reduction/reduce.py for run r, placed in dest. The un-injected run takes them
+        from the cache when this reduction code has already been run on these data."""
+        if r == 0 and red_key:
+            m = rcache.get(red_key)
+            if m and rcache.copy_to(red_key, m, dest):
+                with open(log, "a") as fh:
+                    fh.write("----- preliminary reduction step: products taken from the cache -----\n")
+                return {"cached": True, "first_computed_by": m.get("alg_id"), "first_run_dir": m.get("run_dir"),
+                        "cost_s": m.get("runtime_s")}
+        rd = new_dir("reduce", r)
+        try:
+            (rd / "products").mkdir()
+            o = process("reduce", rd, timeout, cpus, budget_s, log, rd / "products")
+            if o["status"] == "ok":
+                problem = cache.check_products(rd / "products", max_products)
+                if problem:
+                    o.update(status="error", error=problem)
+            if o["status"] != "ok":
+                return {"failed": True, "status": o["status"], "error": o["error"], "seconds": round(o["runtime_s"], 1)}
+            info = {"cached": False, "seconds": round(o["runtime_s"], 1)}
+            if r == 0 and red_key:
+                info["stored"] = rcache.put(red_key, rd / "products", {
+                    "alg_id": alg_id, "run_dir": out.name, "stage": stage, "runtime_s": round(o["runtime_s"], 1),
+                    "cpus": cpus, "reduction_sha": red_sha, "data": data_id})
+            os.replace(rd / "products", dest)
+            return info
+        finally:
+            drop_dir(rd)
+
+    def do_run(r: int, cpus: int, budget_s: int) -> dict:
+        t1, log = time.time(), logs / f"run_{r}.log"
+        d = new_dir("run", r)
+        red = None
+        try:
+            if has_red:
+                red = reduction_step(r, cpus, budget_s, log, d / "products")
+            if red and red.get("failed"):
+                o = {"status": red.pop("status"), "metrics": {}, "diags": {}, "rv_clean": None,
+                     "error": "the preliminary reduction step (reduction/reduce.py) failed:\n" + red.pop("error")}
+            elif timeout - (time.time() - t1) < 10:
+                o = {"status": "timeout", "metrics": {}, "diags": {}, "rv_clean": None,
+                     "error": "timeout: the reduction step used up the time of this run"}
+            else:
+                o = process("run", d, timeout - (time.time() - t1), cpus, budget_s, log,
+                            d / "products" if has_red else None)
+        finally:
+            drop_dir(d)
+        o.update(runtime_s=time.time() - t1, reduction=red, budget_s=budget_s, log=_read(log))
+        return o
 
     def cpu_seconds() -> float:
         u = resource.getrusage(resource.RUSAGE_CHILDREN)
         return u.ru_utime + u.ru_stime
 
     cpu0, wall0 = cpu_seconds(), time.time()
-    runs = [go(0, res["cpus"])]
+    # The un-injected run of the same code on the same data was already computed (screen -> full)?
+    run_key = None if toy else runcache.key(meta["code_sha"], data_id, hsha, env_id, ALG_SEED, res["gpus"])
+    cached0 = runcache.get(alg_id, run_key) if run_key else None
+    if cached0 and cached0["budget_s"] <= budget:
+        budget = cached0["budget_s"]            # all runs of an evaluation see the same ctx.time_budget_s
+        runs = [cached0]
+        meta["uninjected_run_reused_from"] = cached0["reused_from"]
+    else:
+        runs = [do_run(0, res["cpus"], budget)]
+        if run_key:
+            runcache.put(alg_id, run_key, runs[0], out.name)
     # Pre-check (fixed rule, config `precheck`): no reduction of the pipeline scatter -> the
     # algorithm cannot be promoted whatever its planet transfer, so the injections are skipped.
     pre = cfg.get("precheck") or {}
@@ -381,9 +530,15 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
                                              "injection-recovery not run"])
     if runs[0]["status"] == "ok" and skipped is None:
         with ThreadPoolExecutor(max_workers=par) as ex:
-            runs += list(ex.map(lambda r: go(r, max(1, res["cpus"] // par)), range(1, n_runs)))
+            runs += list(ex.map(lambda r: do_run(r, max(1, res["cpus"] // par), budget), range(1, n_runs)))
     cpu_s, wall_s = cpu_seconds() - cpu0, time.time() - wall0
     meta["runtimes_s"] = [round(r["runtime_s"], 1) for r in runs]        # run 0 = un-injected
+    r0red = runs[0].get("reduction") or {}
+    # what the un-injected run would have cost without the reduction cache (bin/swarm.sh timing)
+    meta["uninjected_run_cost_s"] = round(runs[0]["runtime_s"] + (float(r0red.get("cost_s") or 0)
+                                                                   if r0red.get("cached") else 0.0), 1)
+    if has_red:
+        meta["reduction"] = {"sha": red_sha, "runs": [r.get("reduction") for r in runs]}
     meta["n_obs_input"] = int(index.size)
     meta["resources"] = res
     meta["cpu_core_hours"] = cpu_s / 3600
@@ -411,13 +566,33 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
             keep.mkdir(parents=True, exist_ok=True)
             (keep / f"{out.name}.md").write_text(residual_diagnostics.to_markdown(rd))
             rd = None
-    if runs[0]["status"] != "ok":
-        result = finish({"status": "run_failed", "error": runs[0]["error"], "gate_pass": False})
-    elif skipped is not None:
-        skipped["algorithm_metrics"] = runs[0]["metrics"] if publish else {}
-        skipped["residual_diagnostics"] = rd
-        if publish and runs[0]["diags"]:
+    # What the algorithm printed and recorded: kept in full for the humans; published in full only
+    # for the local toy test, in reduced form for development data, not at all for sealed data.
+    if toy:
+        (out / "run_0.log").write_text(runs[0].get("log", ""))
+        if runs[0]["diags"]:
             np.savez_compressed(out / "diagnostics.npz", **runs[0]["diags"])
+    else:
+        keep = config.STATE / "algorithm_outputs" / alg_id / out.name
+        keep.mkdir(parents=True, exist_ok=True)
+        for r, run in enumerate(runs):
+            (keep / f"run_{r}.log").write_text(run.get("log", ""))
+        if runs[0]["diags"]:
+            np.savez_compressed(keep / "diagnostics.npz", **runs[0]["diags"])
+        if runs[0]["metrics"]:
+            (keep / "metrics.json").write_text(json.dumps(runs[0]["metrics"], indent=1))
+    outputs = None
+    if publish and not toy:
+        rows, n_more = sanitize.public_metrics(runs[0]["metrics"], lim)
+        dg, nd_more = sanitize.public_diagnostics(runs[0]["diags"], lim)
+        outputs = {"metrics": rows, "more_metrics": n_more, "diagnostics": dg, "more_diagnostics": nd_more,
+                   "log_tail": sanitize.mask_text(runs[0].get("log", ""), lim)}
+    if runs[0]["status"] != "ok":
+        result = finish({"status": "run_failed", "error": public(runs[0]["error"]), "gate_pass": False,
+                         "algorithm_outputs": outputs})
+    elif skipped is not None:
+        skipped["algorithm_outputs"] = outputs
+        skipped["residual_diagnostics"] = rd
         result = finish(skipped)
     elif smoke:
         # Too few spectra for any statistic: report only whether the code ran and what it returned.
@@ -429,7 +604,7 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
                  plans[1]["truth"], (r1["rv_clean"] - c0) if r1["status"] == "ok" else np.full(index.size, np.nan))]}
         if r1["status"] != "ok":
             m.update(status="run_failed", gate_pass=False,
-                     error="the run with injected planets failed:\n" + r1["error"][-3000:])
+                     error="the run with injected planets failed:\n" + public(r1["error"])[-3000:])
         elif not np.isfinite(c0).any():
             m.update(gate_pass=False, gate_reasons=["no finite output"])
         m["algorithm_metrics"] = runs[0]["metrics"]
@@ -444,10 +619,10 @@ def evaluate(alg_id: str, stage: str, alg_dir: Path | None = None, out_root: Pat
             m.setdefault("gate_reasons", []).append("an injected run crashed or timed out")
             m["meets_target"] = False
             bad = next(r for r in runs[1:] if r["status"] != "ok")
-            m["injected_run_error"] = bad["error"][-1500:]
-        if publish and runs[0]["diags"]:
-            np.savez_compressed(out / "diagnostics.npz", **runs[0]["diags"])
-        m["algorithm_metrics"] = runs[0]["metrics"] if publish else {}
+            m["injected_run_error"] = public(bad["error"])[-1500:]
+        if toy:
+            m["algorithm_metrics"] = runs[0]["metrics"]
+        m["algorithm_outputs"] = outputs
         m["residual_diagnostics"] = rd
         result = finish(m)
     if not keep_scratch:

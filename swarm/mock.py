@@ -9,6 +9,7 @@ title: Mock proposal {tag}
 family_hint: indicator decorrelation
 parents: []
 uses: [indices]
+reduction: {red}
 resources: {{cpus: 2, mem_gb: 8, gpus: 0, hours: 1}}
 predicted: {{rms_null_daily_ms: 0.5, min_transfer: 0.97, confidence: 0.3}}
 ---
@@ -39,6 +40,41 @@ def run(ctx):
 '''
 
 
+RED = '''"""Mock reduction step. Products: fwhm, bis, cahk (one value per observation)."""
+import numpy as np
+
+
+def reduce(ctx):
+    ds = ctx.target
+    return {"fwhm": np.array(ds.scalar("FWHMMOD")), "bis": np.array(ds.scalar("BISMOD")),
+            "cahk": np.array(ds.activity("CaIIHK")[0])}
+'''
+
+ALGO_RED = '''"""Mock implementation on top of a reduction step: linear decorrelation against its products."""
+import numpy as np
+
+
+def run(ctx):
+    ds, p = ctx.target, ctx.reduction()
+    X = np.column_stack([p["fwhm"], p["bis"], p["cahk"]])
+    X = (X - X.mean(0)) / (X.std(0) + 1e-12)
+    A = np.column_stack([X, np.ones(ds.n_obs)])
+    coef, *_ = np.linalg.lstsq(A, ds.rv_pipeline, rcond=None)
+    return {"rv_clean": ds.rv_pipeline - X @ coef[:3]}
+'''
+
+
+def _reduction_choice(user: str, tag: str) -> str:
+    m = re.search(r"<reductions>(.*?)</reductions>", user, re.S)
+    ids = re.findall(r"^\| `([A-Za-z0-9_]+)` \|", m.group(1), re.M) if m else []
+    k = _h(tag, 3)
+    if k == 0:
+        return "new"
+    if k == 1 and ids:
+        return f"reuse {ids[_h(tag, len(ids))]}"
+    return "none"
+
+
 def _h(s: str, n: int) -> int:
     return int(hashlib.md5(s.encode()).hexdigest(), 16) % n
 
@@ -66,7 +102,12 @@ def respond(role: str, user: str, schema, tag: str):
                 "estimated_core_hours_screen": 0.1, "summary": "mock performance advice"}
     if role in ("propose", "reproduce", "revise"):
         extra = f"\n\n## Response to reviewers\nmock revision {_h(user, 10**6)}\n" if role == "revise" else ""
-        return PROPOSAL.format(tag=tag.split(":")[-1]) + extra
+        if role == "revise":                       # keep the declaration of the proposal being revised
+            m = re.search(r"^reduction: (.+)$", user, re.M)
+            red = m.group(1).strip() if m else "none"
+        else:
+            red = _reduction_choice(user, tag) if role == "propose" else "none"
+        return PROPOSAL.format(tag=tag.split(":")[-1], red=red) + extra
     if role == "critique":
         settled = "review round 1 " not in user and _h(tag, 3) != 0
         return f"VERDICT: {'SETTLED' if settled else 'OPEN'}\n1. Failure modes: mock.\n5. RULES: OK"
@@ -82,7 +123,16 @@ def agent(role: str, user: str, toolset, tag: str) -> str:
     m = re.search(r"algorithms/([A-Za-z0-9_]+)/", user)
     alg = m.group(1)
     if "asked for changes" not in user and "performance engineer recommends" not in user:
-        toolset.execute("write_file", {"path": f"algorithms/{alg}/algorithm.py", "content": ALGO})
+        if "REUSES the preliminary reduction step" in user:
+            code = ALGO_RED
+            # must be refused: the reused step is read-only
+            toolset.execute("write_file", {"path": f"algorithms/{alg}/reduction/reduce.py", "content": "# changed\n"})
+        elif "has a NEW preliminary reduction step" in user:
+            code = ALGO_RED
+            toolset.execute("write_file", {"path": f"algorithms/{alg}/reduction/reduce.py", "content": RED})
+        else:
+            code = ALGO
+        toolset.execute("write_file", {"path": f"algorithms/{alg}/algorithm.py", "content": code})
         toolset.execute("write_file", {"path": f"algorithms/{alg}/algorithm.yaml",
                                        "content": "name: mock\nfamily: F03\nresources: {cpus: 2, mem_gb: 8, hours: 1, gpus: 0}\n"})
         toolset.execute("write_file", {"path": f"algorithms/{alg}/IMPLEMENTATION_NOTES.md", "content": "mock notes\n"})

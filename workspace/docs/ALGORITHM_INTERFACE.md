@@ -13,6 +13,7 @@ An algorithm lives in `workspace/algorithms/<alg_id>/`:
 | `algorithm.py` | must define `run(ctx)`; may import sibling `.py` files in the same directory |
 | `algorithm.yaml` | name, family, resource request (below) |
 | `native/` (optional) | C, C++, Fortran or Julia sources called from `algorithm.py` (section 5a) |
+| `reduction/` (optional) | a preliminary reduction step, `reduce.py` with `reduce(ctx)` (section 2a) |
 | `IMPLEMENTATION_NOTES.md` | what was built, every deviation from the spec and why |
 
 ```yaml
@@ -53,9 +54,52 @@ A real planet's Doppler signal must survive in it.
   or per day) fails the run.
 * The function is called in a fresh process for each run of an evaluation. The same
   code is run two or three times on data that differ only by hidden injected planets;
-  there is no way to tell the runs apart, and nothing persists between them.
+  there is no way to tell the runs apart, and nothing persists between them: each process
+  has its own private directory (its scratch files included), deleted when it ends.
+* The result must not depend on the time budget, on `ctx.n_cpus`, or on whether
+  reduction products came from the cache (section 2a): the harness takes differences
+  between runs, and at the full stage it does not repeat the un-injected run of the
+  screen stage when the code is unchanged.
 * Do not print or return anything that depends on knowing the hidden planets; you
   cannot know them.
+
+## 2a. Optional: a preliminary reduction step
+
+Many methods start with an expensive step that depends on the data alone and not on the
+correction model: line-by-line RVs and their errors, per-line shape measurements, a stack
+of residual spectra. Such a step can be split off, so that it is computed once and reused:
+
+```python
+# reduction/reduce.py
+"""Line-by-line RVs against a template built from all spectra.
+
+Products: lbl_rv [n_obs, n_lines] m/s; lbl_err [n_obs, n_lines] m/s; line_wave [n_lines] Angstrom.
+"""
+def reduce(ctx):
+    ds = ctx.target
+    ...
+    return {"lbl_rv": rv, "lbl_err": err, "line_wave": wave}      # numeric arrays only
+
+# algorithm.py
+def run(ctx):
+    p = ctx.reduction()           # exactly what reduce(ctx) returned, as read-only arrays
+    ...
+```
+
+* `reduce(ctx)` runs in its own process before `run(ctx)`, on the same data (including
+  any hidden planets). It gets the same `ctx` except `ctx.metric`, `ctx.diagnostic` and
+  `ctx.reduction`. It returns a dict of numeric arrays (names are identifiers; at most 64
+  arrays); `run(ctx)` receives nothing else from it.
+* All its code lives in `reduction/` (`.py` files that import each other, and an
+  optional `reduction/native/`). `algorithm.py` cannot import from `reduction/`.
+* The harness caches the products of the run WITHOUT hidden planets, under the exact
+  code of `reduction/` and the data set. Every later algorithm whose `reduction/` is
+  byte-identical gets them without recomputing. Runs with hidden planets always
+  recompute the step: each algorithm has its own planets.
+* Proposals declare it in the front matter: `reduction: none`, `new` (specified in the
+  proposal) or `reuse <algorithm id>`. For `reuse`, the orchestrator copies that
+  algorithm's `reduction/` unchanged and it is read-only for the implementer.
+  `workspace/registry/REDUCTIONS.md` lists the reduction steps that exist.
 
 ## 3. `ctx`
 
@@ -63,16 +107,30 @@ A real planet's Doppler signal must survive in it.
 |---|---|
 | `ctx.target` | `SolarDataset` (section 4) |
 | `ctx.n_cpus`, `ctx.gpu` | granted CPU cores; whether a CUDA GPU is available |
-| `ctx.time_budget_s`, `ctx.elapsed()` | wall-time budget for this run and seconds used so far. Exceeding it kills the run. |
+| `ctx.time_budget_s`, `ctx.elapsed()` | wall-time budget for this run (the same in every run of an evaluation) and seconds used so far. Exceeding it kills the run. |
 | `ctx.seed` | integer; use it for all random number generators (identical across runs) |
-| `ctx.scratch_file(name)` | path string of a private scratch file (flat names like `"feat.npy"`); use with `np.save`, `np.load`, `np.memmap`, `torch.save`. Wiped after the run. |
+| `ctx.scratch_file(name)` | path string of a private scratch file (flat names like `"feat.npy"`); use with `np.save`, `np.load`, `np.memmap`, `torch.save`. Deleted when the run's process ends. |
+| `ctx.reduction()` | dict of the products of the algorithm's preliminary reduction step (section 2a) |
 | `ctx.native_library(openmp=False, flags=())`, `ctx.native_file(name)` | compiled-language support, section 5a |
-| `ctx.log(*parts)` | progress message (the log tail of the un-injected dev run is shown in the result report) |
-| `ctx.metric(name, value)` | record a scalar intermediate check; printed in the result report |
-| `ctx.diagnostic(name, array)` | record a small array (periodogram, eigen-spectrum, coefficients...); summarised in the report. 20 MB total. |
+| `ctx.log(*parts)` | progress message, with the elapsed time |
+| `ctx.metric(name, value)` | record a scalar intermediate check for the result report |
+| `ctx.diagnostic(name, array)` | record a small array (periodogram, eigen-spectrum, coefficients...) for the result report. 20 MB total. |
 
 `ctx.metric` / `ctx.diagnostic` are how proposers get the intermediate checks they
-asked for. They are published for development-data runs only, never for sealed runs.
+asked for. Reports on real data show what the algorithm itself prints and records only
+in reduced form, so that per-epoch values of the data never reach the collaboration:
+
+* development data (screen, full), un-injected run only: up to 20 `ctx.metric` values,
+  rounded to 3 significant digits; up to 8 `ctx.diagnostic` arrays, each as shape and
+  summary statistics, with the values themselves only for arrays of at most 16 numbers
+  (rounded); the last 40 lines of the log with every digit shown as `#`, except the time
+  stamps of `ctx.log` lines and the line numbers in tracebacks. Error messages are masked
+  the same way.
+* sealed data: only the masked error message, if the run failed.
+* the local self-test (`run_tests`, section 7): everything, unchanged.
+
+So put the numbers you need into `ctx.metric` and into short `ctx.diagnostic` arrays (an
+eigenvalue spectrum, a few coefficients, a coarse periodogram), not into log lines.
 
 ## 4. `SolarDataset`
 
@@ -227,8 +285,8 @@ scientists maintain this list: ask for another diagnostic with a `REQUEST TO HUM
 line in a post-mortem. Sealed reports contain none.
 
 Stages: `screen` (development data, 1 injection) -> `full` (development
-data, 2 injections) -> `sealed` (rationed). Promotion between stages follows fixed
-numerical rules.
+data, 2 injections; its un-injected run is the screen one when the code is unchanged) ->
+`sealed` (rationed). Promotion between stages follows fixed numerical rules.
 
 ## 6a. Reviews between implementation and evaluation
 
@@ -254,6 +312,8 @@ the cluster. Consequences for implementers:
 * Never tune anything to those few spectra.
 * The report lists, per spectrum, the injected shift and the change in your output; for a
   planet-preserving method these agree.
+* It shows your log, `ctx.metric` values and `ctx.diagnostic` arrays unchanged (reports
+  on real data show them only in reduced form, section 3).
 
 If no real frames are configured, a toy synthetic Sun with the same array shapes is used
 instead (about 300 observations over about 900 days). It is not physically faithful.

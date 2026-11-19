@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import difflib
 import errno
 import fcntl
@@ -32,6 +33,7 @@ from pathlib import Path
 import anthropic
 import yaml
 
+from harness import cache as hcache
 from harness import config as hconfig
 from harness import promote
 
@@ -132,6 +134,37 @@ def front_matter(text: str) -> tuple[dict, str]:
     except yaml.YAMLError:
         fm = {}
     return (fm if isinstance(fm, dict) else {}), m.group(2)
+
+
+def reduction_decl(fm: dict) -> tuple[str, str | None]:
+    """The `reduction` front matter of a specification: ('none' | 'new' | 'reuse', algorithm id or None)."""
+    v = fm.get("reduction")
+    if isinstance(v, dict):
+        if v.get("reuse"):
+            return "reuse", str(v["reuse"]).strip().strip("`")
+        v = "new" if v.get("new") else "none"
+    txt = str(v or "none").strip()
+    m = re.match(r"(?i)reuse\b[\s:=`]*([A-Za-z0-9_:.\-]+)", txt)
+    if m:
+        return "reuse", m.group(1).strip("`")
+    return ("new", None) if txt.lower().startswith("new") else ("none", None)
+
+
+def _uses_list(v) -> list[str]:
+    v = v or []
+    if isinstance(v, str):
+        v = [u for u in re.split(r"[,\s\[\]]+", v) if u]
+    return [str(u).strip().lower() for u in v]
+
+
+def reduction_doc(red_dir: Path, cap: int = 700) -> str:
+    """The module docstring of reduction/reduce.py on one line: what the step returns."""
+    try:
+        doc = ast.get_docstring(ast.parse((red_dir / "reduce.py").read_text())) or ""
+    except (OSError, SyntaxError):
+        doc = ""
+    doc = " ".join(doc.split()).replace("|", "/")
+    return (doc[:cap] + " ...") if len(doc) > cap else (doc or "(no docstring)")
 
 
 def read(p: Path, cap: int | None = None) -> str:
@@ -255,15 +288,60 @@ class Cycle:
         return " ".join(parts)
 
     def out_of_scope(self, pid: str) -> list[str]:
-        """Data products a proposal declares in `uses` that this swarm's scope does not allow."""
+        """Data products a proposal declares in `uses` that this swarm's scope does not allow
+        (a reused reduction step brings the data products of the proposal it came from)."""
         allowed = {str(u).strip().lower() for u in ((self.cfg.get("scope") or {}).get("allowed_uses") or [])}
         if not allowed:
             return []
         fm, _ = front_matter(spec_text(pid, self.reg))
-        uses = fm.get("uses") or []
-        if isinstance(uses, str):
-            uses = [u for u in re.split(r"[,\s\[\]]+", uses) if u]
-        return sorted({str(u).strip().lower() for u in uses} - allowed)
+        uses = set(_uses_list(fm.get("uses")))
+        mode, src = reduction_decl(fm)
+        if mode == "reuse" and src in self.reg["proposals"] and self.reg["proposals"][src].get("cycle") is not None:
+            uses |= set(_uses_list(front_matter(spec_text(src, self.reg))[0].get("uses")))
+        return sorted(uses - allowed)
+
+    # ---- preliminary reduction steps (interface section 2a) ---------------------------------------
+    def reduction_of(self, pid: str) -> tuple[str, str | None]:
+        return reduction_decl(front_matter(spec_text(pid, self.reg))[0])
+
+    def reuse_problem(self, pid: str) -> str:
+        """Why a declared `reduction: reuse <id>` cannot be honoured, or ''."""
+        mode, src = self.reduction_of(pid)
+        if mode == "reuse" and not (WORKSPACE / "algorithms" / str(src) / "reduction" / "reduce.py").is_file():
+            return (f"declares `reduction: reuse {src}`, but this swarm has no algorithm `{src}` with a "
+                    "reduction step")
+        return ""
+
+    def reductions_md(self, slot: str | None = None) -> str:
+        """Table of the distinct reduction steps in this swarm (byte-identical code counts once).
+        slot: only those that occur in this proposer's own algorithms."""
+        groups: dict[str, list[str]] = {}
+        for f in sorted((WORKSPACE / "algorithms").glob("*/reduction/reduce.py")):
+            alg = f.parent.parent.name
+            if not self.reg["proposals"].get(alg, {}).get("moved_to"):
+                groups.setdefault(hcache.tree_sha(f.parent), []).append(alg)
+        rows = []
+        for sha, algs in groups.items():
+            algs.sort(key=lambda a: (self.reg["proposals"].get(a, {}).get("cycle", 0), a))
+            if slot and not any(self.reg["proposals"].get(a, {}).get("slot") == slot for a in algs):
+                continue
+            secs = []
+            for a in algs:
+                for mf in (WORKSPACE / "results" / a).glob("*/metrics.json"):
+                    try:
+                        red = json.loads(mf.read_text()).get("reduction") or {}
+                    except (OSError, ValueError):
+                        continue
+                    secs += [float(x["seconds"]) for x in red.get("runs") or []
+                             if x and not x.get("cached") and not x.get("failed") and x.get("seconds") is not None]
+            cost = f"about {sorted(secs)[len(secs) // 2] / 60:.2g} min per run" if secs else "not measured yet"
+            p = self.reg["proposals"].get(algs[0], {})
+            rows.append(f"| `{algs[0]}` | {p.get('family') or '-'} | {reduction_doc(WORKSPACE / 'algorithms' / algs[0] / 'reduction')} "
+                        f"| {cost} | {', '.join(f'`{a}`' for a in algs[1:]) or '-'} |")
+        if not rows:
+            return ""
+        return "\n".join(["| reuse with | family | what it returns (from its docstring) | CPU time on the development data | also used by |",
+                          "|---|---|---|---|---|"] + rows)
 
     def informed_slots(self) -> set[str]:
         if self.n <= self.c["independence_cycles"]:
@@ -335,6 +413,10 @@ class Cycle:
         (WORKSPACE / "registry").mkdir(exist_ok=True)
         (WORKSPACE / "registry" / "LEADERBOARD.md").write_text(
             "# Leaderboard (best stage reached per algorithm)\n\n" + self.leaderboard_md() + "\n")
+        (WORKSPACE / "registry" / "REDUCTIONS.md").write_text(
+            "# Preliminary reduction steps in this swarm\n\nA proposal reuses one with `reduction: reuse <id>` "
+            "(interface section 2a). Its products on the un-injected data are cached by the harness.\n\n"
+            + (self.reductions_md() or "None yet.") + "\n")
         self.save()
         log(f"sync_results: {new} new result(s)")
 
@@ -463,9 +545,11 @@ class Cycle:
                     shared += [read(s, 7000).split("<details>")[0] for s in sems]
                 human = "\n\n".join(human_all.values()) if (i + self.n) % 3 == 0 else ""
                 nb = read(WORKSPACE / "agents" / sid / "notebook.md")[-6000:]
+                # during the independent opening cycles a proposer sees only its own reduction steps
+                reds = self.reductions_md(sid if self.n <= self.c["independence_cycles"] else None)
                 items[pid] = prompts.proposer_prompt(slot, self.n, self.library(slot["knowledge"]), nb,
                                                      self.history(sid), directive, "\n\n".join(shared), human,
-                                                     scope=self.scope_text())
+                                                     scope=self.scope_text(), reductions=reds)
                 meta[pid] = {"slot": sid, "kind": "idea", "redirected": bool(directive)}
         out = self.llm.call_many("propose", self.system, items, phase_tag=self.tag("propose"))
 
@@ -640,6 +724,7 @@ class Cycle:
             if len(viol) >= 2:
                 blocked.add(pid)
         oos = {pid: x for pid in cands if (x := self.out_of_scope(pid))}
+        bad_reuse = {pid: x for pid in cands if (x := self.reuse_problem(pid))}
         specs = "\n\n".join(f"<proposal id=\"{pid}\" family=\"{self.reg['proposals'][pid]['family']}\" "
                             f"novelty=\"{self.reg['proposals'][pid].get('novelty', 0.5):.2f}\">\n"
                             f"{spec_text(pid, self.reg)[:26000]}\n</proposal>" for pid in cands)
@@ -659,7 +744,8 @@ class Cycle:
                 borda[pid] += len(cands) - rank
             for x in r.get("ranking", []):
                 why[x["id"]].append(f"{mk}: {x['rationale']}")
-        ranked = sorted((c for c in cands if c not in blocked and c not in oos), key=lambda c: (-borda[c], c))
+        ranked = sorted((c for c in cands if c not in blocked and c not in oos and c not in bad_reuse),
+                        key=lambda c: (-borda[c], c))
         stats = registry.family_stats(self.reg)
         fam = lambda pid: self.reg["proposals"][pid]["family"]
         cap = max(1, math.ceil(self.c["max_family_share"] * K))
@@ -691,7 +777,8 @@ class Cycle:
         for pid in cands:
             reason.setdefault(pid, "blocked: rule violation flagged by two or more reviewers" if pid in blocked
                               else (f"out of this swarm's scope (uses {', '.join(oos[pid])})" if pid in oos
-                                    else "not selected this cycle (ranked below the cut)"))
+                                    else (f"not implementable: it {bad_reuse[pid]}" if pid in bad_reuse
+                                          else "not selected this cycle (ranked below the cut)")))
         for pid in forced:
             chosen.append(pid)
             reason[pid] = "selected automatically (reference reproduction or human priority request)"
@@ -730,7 +817,7 @@ class Cycle:
         log(f"moderate: selected {len(chosen)} of {len(cands) + len(forced)}")
 
     # ---- implementation -------------------------------------------------------------------------
-    def _alg_files(self, alg_dir: Path) -> str:
+    def _alg_files(self, alg_dir: Path, reused_from: str | None = None) -> str:
         parts = []
         for p in sorted(alg_dir.iterdir()):
             if p.suffix in (".py", ".yaml", ".md") and p.name not in ("SPEC.md", "REVIEW.md"):
@@ -739,6 +826,14 @@ class Cycle:
             for p in sorted((alg_dir / "native").iterdir()):
                 if p.is_file():
                     parts.append(f"===== native/{p.name} =====\n{read(p, 60000)}")
+        red = alg_dir / "reduction"
+        if red.is_dir() and reused_from:
+            parts.append(f"===== reduction/ =====\nReused unchanged from `{reused_from}` (reviewed with that algorithm; "
+                         f"not part of this review). What it returns, from reduce.py:\n{reduction_doc(red, 4000)}")
+        elif red.is_dir():
+            for p in sorted(red.rglob("*")):
+                if p.is_file() and "__pycache__" not in p.parts:
+                    parts.append(f"===== reduction/{p.relative_to(red)} =====\n{read(p, 60000)}")
         return "\n\n".join(parts)
 
     @staticmethod
@@ -757,6 +852,19 @@ class Cycle:
                 out.append(str(r))
         return out
 
+    @staticmethod
+    def _vendor_reduction(src: str, alg_dir: Path) -> bool:
+        """Put an unchanged copy of algorithm `src`'s reduction step into alg_dir/reduction/ (again, if
+        it was changed). -> False if `src` has none."""
+        sdir = WORKSPACE / "algorithms" / src / "reduction"
+        if not (sdir / "reduce.py").is_file():
+            return False
+        dst = alg_dir / "reduction"
+        if not dst.is_dir() or hcache.tree_sha(dst) != hcache.tree_sha(sdir):
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(sdir, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        return True
+
     def _implement_one(self, pid: str) -> str:
         p = self.reg["proposals"][pid]
         alg_dir = WORKSPACE / "algorithms" / pid
@@ -764,8 +872,21 @@ class Cycle:
         (alg_dir / "SPEC.md").write_text(spec_text(pid, self.reg))
         parents = [x for x in p.get("parents", []) if (WORKSPACE / "algorithms" / x).exists()]
         refs = [f"algorithms/{d.name}" for d in (WORKSPACE / "algorithms").glob("baseline_*")]
-        ts = Toolset(read_roots=["docs", "literature"] + refs + [f"algorithms/{x}" for x in parents],
-                     write_roots=[f"algorithms/{pid}"], alg_dir=alg_dir, allow_tests=True)
+        # `reduction: reuse <id>`: the orchestrator, not the implementer, copies that step in, unchanged
+        red_mode, red_src = self.reduction_of(pid)
+        reused = red_src if red_mode == "reuse" else None
+        if reused and not self._vendor_reduction(reused, alg_dir):
+            (alg_dir / "REVIEW.md").write_text(f"# Not implemented\n\nThe specification reuses the reduction step "
+                                               f"of `{reused}`, which does not exist in this swarm.\n")
+            with _reg_lock:
+                p["status"] = "implementation_failed"
+            self.save()
+            return "implementation_failed"
+        extra_read = [f"algorithms/{reused}"] if reused else []
+        ts = Toolset(read_roots=["docs", "literature"] + refs + [f"algorithms/{x}" for x in parents] + extra_read,
+                     write_roots=[f"algorithms/{pid}"], alg_dir=alg_dir, allow_tests=True,
+                     read_only={f"algorithms/{pid}/reduction": f"the reduction step reused unchanged from {reused}"}
+                     if reused else None)
         review, toy_ok, toy_report = {}, False, ""
         use_num, use_perf = self.c.get("numerics_review", True), self.c.get("performance_review", True)
         max_rounds = self.c["implement_fix_rounds"]
@@ -773,13 +894,15 @@ class Cycle:
         shutil.rmtree(backup, ignore_errors=True)
         perf, perf_note, before, rnd = None, "", None, 0
         try:
-            self.llm.agent("implement", self.system, prompts.implement_prompt(pid, parents), ts,
+            self.llm.agent("implement", self.system, prompts.implement_prompt(pid, parents, (red_mode, red_src)), ts,
                            self.c["implement_max_turns"], tag=f"{self.tag('implement')}:{pid}")
             while True:
+                if reused:
+                    self._vendor_reduction(reused, alg_dir)      # read-only for the agent; checked anyway
                 if not (alg_dir / "algorithm.py").exists():
                     toy_ok, toy_report = False, "algorithm.py was never written"
                 else:
-                    self._fix_manifest(alg_dir, p)
+                    self._fix_manifest(alg_dir, p, reused)
                     toy_report, toy_ok = run_toy(alg_dir)
                 if before is not None:                   # first test after the optimisation pass
                     after = toy_fingerprint(alg_dir)
@@ -792,7 +915,7 @@ class Cycle:
                                    f"before and after: {change}. An optimisation must change results by "
                                    "rounding only.")
                     before = None
-                spec, files = read(alg_dir / "SPEC.md", 40000), self._alg_files(alg_dir)
+                spec, files = read(alg_dir / "SPEC.md", 40000), self._alg_files(alg_dir, reused)
                 with ThreadPoolExecutor(2) as ex:        # code reviewer and numerical analyst, independently
                     f_rev = ex.submit(self.llm.call, "review", self.system, prompts.review_prompt(
                         pid, spec, files, toy_report), prompts.REVIEW_SCHEMA, f"{self.tag('review')}:{pid}#{rnd}")
@@ -871,8 +994,9 @@ class Cycle:
         return status
 
     @staticmethod
-    def _fix_manifest(alg_dir: Path, p: dict) -> None:
-        """Make sure algorithm.yaml exists, parses and carries the registry's family id."""
+    def _fix_manifest(alg_dir: Path, p: dict, reused: str | None = None) -> None:
+        """Make sure algorithm.yaml exists, parses and carries the registry's family id (and, for the
+        humans, where a reduction step comes from)."""
         mf = alg_dir / "algorithm.yaml"
         try:
             man = yaml.safe_load(mf.read_text()) if mf.exists() else {}
@@ -882,6 +1006,10 @@ class Cycle:
         man.setdefault("name", p.get("title", alg_dir.name))
         man["family"] = p.get("family")
         man.setdefault("resources", {})
+        if (alg_dir / "reduction" / "reduce.py").is_file():
+            man["reduction"] = f"reuse {reused}" if reused else "own"
+        else:
+            man.pop("reduction", None)
         mf.write_text(yaml.safe_dump(man, sort_keys=False))
 
     def implement(self) -> None:

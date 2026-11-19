@@ -41,6 +41,8 @@ from pathlib import Path
 
 import yaml
 
+from harness import cache as hcache
+from harness import config as hconfig
 from harness import promote
 
 from . import registry
@@ -77,7 +79,10 @@ def _wall_hours(m: dict) -> float | None:
 
 
 def _minutes_per_run(m: dict) -> float | None:
-    """Wall time of the un-injected run (the same work for every algorithm at a stage)."""
+    """Wall time of the un-injected run (the same work for every algorithm at a stage), counting a
+    reduction step taken from the cache at the time it took to compute."""
+    if m.get("uninjected_run_cost_s") is not None:
+        return float(m["uninjected_run_cost_s"]) / 60
     if m.get("runtimes_s"):
         return float(m["runtimes_s"][0]) / 60
     wh = _wall_hours(m)
@@ -136,8 +141,10 @@ def timing(slow_minutes: float | None = None) -> None:
         return
     tot_res = sum(r["reserved"] for r in rows) or 1e-9
     L += ["'min/run' is the wall time of the un-injected run at the earliest stage reached (screen: the "
-          "same data for every algorithm). 'core-h reserved' is what the allocation is charged (CPUs "
-          "requested x wall time) over all stages; 'core-h used' is the CPU time the code actually used.", "",
+          "same data for every algorithm), with a preliminary reduction step counted at the time it took to "
+          "compute even where its products came from the cache. 'core-h reserved' is what the allocation is "
+          "charged (CPUs requested x wall time) over all stages; 'core-h used' is the CPU time the code "
+          "actually used.", "",
           "## Algorithms, slowest first", "",
           "| algorithm | proposer | family | uses | stage | min/run | s per spectrum | core-h reserved | core-h used | CPU busy | CPUs | status |",
           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
@@ -378,6 +385,7 @@ def move(dest: str, slots: list[str], families: list[str], copy: bool, reevaluat
                 p["status"] = f"moved_to_{dname}"
                 if (WORKSPACE / "algorithms" / pid).exists():
                     shutil.rmtree(WORKSPACE / "algorithms" / pid)          # a copy is in the bundle
+                hcache.RunCache(hconfig.load()).drop(pid)                  # stored runs on this swarm's data
             for name_ in queued:
                 (bdir / "cancelled_tickets").mkdir(exist_ok=True)
                 try:
@@ -429,7 +437,7 @@ def _copy_rewrite(src: Path, dst: Path, rw) -> None:
             a, b = Path(dirpath) / fn, dst / rel / fn
             if a.suffix == ".pyc":
                 continue
-            if a.suffix in TEXT_SUFFIXES:
+            if a.suffix in TEXT_SUFFIXES and "reduction" not in rel.parts:   # a reduction step stays byte-identical
                 b.write_text(rw(a.read_text(errors="replace")))
             else:
                 shutil.copy2(a, b)
